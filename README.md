@@ -2,7 +2,7 @@
 
 Bridging the gap between Statistical Inference and Deep Learning.
 
-Parametrix is a Python package built on top of TensorFlow/Keras designed to fully integrate statistical modeling with neural network components. It allows researchers and data scientists to define any statistical model where parameters can be:
+Thetaflow is a Python package built on top of TensorFlow/Keras designed to fully integrate statistical modeling with neural network components. It allows researchers and data scientists to define any statistical model where parameters can be:
 
 Dynamic: Modeled as outputs of a complex neural network.
 
