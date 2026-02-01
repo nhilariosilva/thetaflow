@@ -1,0 +1,16 @@
+# Pycache directory
+**/__pycache__/
+
+# Jupyter Notebook checkpoints
+**/.ipynb_checkpoints/
+
+**/thetaflow.egg-info/
+**/build/
+
+.Rhistory
+
+pyproject.toml
+LICENSE
+
+**/venv/
+**/env/
