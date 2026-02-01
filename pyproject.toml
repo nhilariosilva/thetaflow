@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thetaflow"
+version = "0.0.1"
+description = "Bridging the gap between Statistical Inference and Neural Networks"
+readme = "README.md"
+authors = [{ name = "Natan Hilario da Silva", email = "natan.hilario@usp.br" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "tensorflow>=2.10.0",
+    "keras>=2.9.0",
+    "numpy",
+    "pandas" # add whatever else you use
+]
+requires-python = ">=3.8"
+
+[project.urls]
+"Homepage" = "https://github.com/nhilariosilva/thetaflow"
+"Bug Tracker" = "https://github.com/nhilariosilva/thetaflow/issues"
+
+[tool.setuptools]
+packages = ["thetaflow"]

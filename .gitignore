@@ -1,0 +1,10 @@
+# Pycache directory
+__pycache__/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+.Rhistory
+
+venv/
+env/

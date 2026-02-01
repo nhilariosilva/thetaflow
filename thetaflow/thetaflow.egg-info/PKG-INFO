@@ -1,0 +1,65 @@
+Metadata-Version: 2.4
+Name: thetaflow
+Version: 0.0.1
+Summary: Bridging the gap between Statistical Inference and Neural Networks
+Author-email: Natan Hilario da Silva <natan.hilario@usp.br>
+License: MIT License
+        
+        Copyright (c) 2026 Natan Hilario da Silva
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/yourusername/thetaflow
+Project-URL: Bug Tracker, https://github.com/yourusername/thetaflow/issues
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Scientific/Engineering :: Mathematics
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: tensorflow>=2.10.0
+Requires-Dist: keras>=2.9.0
+Requires-Dist: numpy
+Requires-Dist: pandas
+Dynamic: license-file
+
+# Thetaflow
+
+Bridging the gap between Statistical Inference and Deep Learning.
+
+Thetaflow is a Python package built on top of TensorFlow/Keras designed to fully integrate statistical modeling with neural network components. It allows researchers and data scientists to define any statistical model where parameters can be:
+
+Dynamic: Modeled as outputs of a complex neural network.
+
+Static: Treated as independent, learnable weights (standard statistical coefficients).
+
+Hybrid: A mix of both within the same likelihood function.
+
+It generalizes Maximum Likelihood Estimation (MLE) for a massive class of models, acting as a flexible optimizer that brings the power of backpropagation to rigorous statistical inference.
+
+Key Features
+Flexible Parameter Definition: seamless mixing of deep learning outputs and scalar statistical parameters.
+
+Custom Likelihoods: Define any probability density function (PDF) or mass function (PMF) as your objective.
+
+TensorFlow/Keras Backend: leverages hardware acceleration (GPU/TPU) and automatic differentiation for complex optimization landscapes.
+
+General Optimizer: Solves for the Maximum Likelihood Estimate (MLE) across arbitrary model architectures.
