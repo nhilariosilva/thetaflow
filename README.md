@@ -22,4 +22,8 @@ The easiest and recommended way to install `thetaflow` is directly from PyPI usi
 
 ```bash
 pip install thetaflow
+```
 
+## Examples
+
+An example application applying the standard simple linear regression model can be seen in the examples directory. I plan on adding further documentation! :)
