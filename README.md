@@ -15,3 +15,11 @@ Key Features
 - Custom Likelihoods: Define any probability density function (PDF) or mass function (PMF) as your objective.
 - TensorFlow/Keras Backend: leverages hardware acceleration (GPU/TPU) and automatic differentiation for complex optimization landscapes.
 - General Optimizer: Solves for the Maximum Likelihood Estimate (MLE) across arbitrary model architectures.
+
+## Installation
+
+The easiest and recommended way to install `thetaflow` is directly from PyPI using `pip`:
+
+```bash
+pip install thetaflow
+
