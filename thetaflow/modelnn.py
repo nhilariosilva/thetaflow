@@ -796,7 +796,7 @@ class ModelNN(keras.models.Model):
                         stop_training = True
                     previous_independent_predictions = new_independent_predictions
                 else:
-                    nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0) )**2, axis = 0 )                   
+                    nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0) )**2, axis = 0 )
                     distances_norm = tf.norm(nn_distances, ord = 2)
                     if(early_stopping and distances_norm < early_stopping_tolerance and epoch > early_stopping_warmup):
                         # tf.print("\nStopping. Model has converged at epoch", epoch)
