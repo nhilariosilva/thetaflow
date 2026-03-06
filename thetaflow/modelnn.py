@@ -771,15 +771,15 @@ class ModelNN(keras.models.Model):
     
                 # tf.print("new inde pred", new_independent_predictions)
                 # tf.print("new nn pred", new_nn_predictions)
-                
+
                 if(self.independent_pars_use and self.neural_network_use):
-                    independent_distances = ( (new_independent_predictions - previous_independent_predictions)/(previous_independent_predictions + 1.0) )**2
-                    nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0) )**2, axis = 0 )
-    
+                    independent_distances = ( (new_independent_predictions - previous_independent_predictions)/(tf.math.abs(previous_independent_predictions) + 1.0e-6) )**2
+                    nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0e-6) )**2, axis = 0 )
+                    
                     # Concatenate all distances into a single array and take its norm
                     all_distances = tf.concat([independent_distances, nn_distances], axis = 0)
                     
-                    distances_norm = tf.norm(all_distances, ord = 2)
+                    distances_norm = tf.math.sqrt( tf.reduce_sum(all_distances) )
                     
                     if(early_stopping and distances_norm < early_stopping_tolerance and epoch > early_stopping_warmup):
                         # tf.print("\nStopping. Model has converged at epoch", epoch)
@@ -788,16 +788,16 @@ class ModelNN(keras.models.Model):
                     previous_nn_predictions = new_nn_predictions
                     previous_independent_predictions = new_independent_predictions
                 elif(self.independent_pars_use):
-                    independent_distances = ( (new_independent_predictions - previous_independent_predictions)/(previous_independent_predictions + 1.0) )**2
-                    distances_norm = tf.norm(independent_distances, ord = 2)
+                    independent_distances = ( (new_independent_predictions - previous_independent_predictions)/(tf.math.abs(previous_independent_predictions) + 1.0e-6) )**2
+                    distances_norm = tf.math.sqrt( tf.reduce_sum(independent_distances) )
                     
                     if(early_stopping and distances_norm < early_stopping_tolerance and epoch > early_stopping_warmup):
                         # tf.print("\nStopping. Model has converged at epoch", epoch)
                         stop_training = True
                     previous_independent_predictions = new_independent_predictions
                 else:
-                    nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0) )**2, axis = 0 )
-                    distances_norm = tf.norm(nn_distances, ord = 2)
+                    nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0e-6) )**2, axis = 0 )
+                    distances_norm = tf.math.sqrt( tf.reduce_sum(nn_distances) )
                     if(early_stopping and distances_norm < early_stopping_tolerance and epoch > early_stopping_warmup):
                         # tf.print("\nStopping. Model has converged at epoch", epoch)
                         stop_training = True
@@ -850,9 +850,9 @@ class ModelNN(keras.models.Model):
 
                             # If minimum learning rate is reached, stop training
                             if( early_stopping and (tf.equal(new_lr_ind, reduce_lr_min_lr) or tf.equal(new_lr_nn, reduce_lr_min_lr)) and (not minimal_lr_achieved) ):
-                                tf.print("\nMinimal learning rate achieved on epoch", epoch, ".")
+                                # tf.print("\nMinimal learning rate achieved on epoch", epoch, ".")
                                 minimal_lr_achieved = True
-                                # stop_training = True
+                                stop_training = True
                 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
                 
                 # --------------------------------------------- Native progress tracker without great performance lose ---------------------------------------------
@@ -923,7 +923,7 @@ class ModelNN(keras.models.Model):
                     reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10,
                     reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                     deterministic = True,
-                    verbose = True, print_freq = 100, track_time = True, supress_warnings = False):
+                    verbose = True, print_freq = 100, track_time = True):
         
         # Format the input data accordingly and prepare training and validation datasets
         self.config_training(x, data,
@@ -1070,7 +1070,7 @@ class ModelNN(keras.models.Model):
                         reduce_lr = True, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10, reduce_lr_cooldown = 0,
                         reduce_lr_min_lr = 5e-4,
                         deterministic = True,
-                        verbose = True, track_time = True):
+                        verbose = True, print_freq = 100, track_time = True):
         
         # Format the input data accordingly and prepare training and validation datasets
         self.config_training(x, data,
@@ -1129,6 +1129,27 @@ class ModelNN(keras.models.Model):
                 set_global_seed(seed = self.seed, verbose = verbose)
             else:
                 set_global_seed(seed = None, verbose = verbose)
+
+                # Force the optimizers to build their state variables in Python so they don't try to create them inside the C++ when function is called a second time
+            if self.independent_pars_use and not getattr(self.optimizer_independent, 'built', False):
+                self.optimizer_independent.build( self.trainable_variables[:len(self.independent_pars)] )
+            if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
+                self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
+            
+            epochs = tf.constant(epochs, dtype = tf.int32)
+            metrics_update_freq = tf.constant(metrics_update_freq, dtype = tf.int32)
+            
+            early_stopping_tolerance = tf.constant(early_stopping_tolerance, dtype = tf.float32)
+            early_stopping_warmup = tf.constant(early_stopping_warmup, dtype = tf.int32)
+    
+            reduce_lr_warmup = tf.constant(reduce_lr_warmup, dtype = tf.int32)
+            reduce_lr_factor = tf.constant(reduce_lr_factor, dtype = tf.float32)
+            reduce_lr_min_delta = tf.constant(reduce_lr_min_delta, dtype = tf.float32)
+            reduce_lr_patience = tf.constant(reduce_lr_patience, dtype = tf.int32)
+            reduce_lr_cooldown = tf.constant(reduce_lr_cooldown, dtype = tf.int32)
+            reduce_lr_min_lr = tf.constant(reduce_lr_min_lr, dtype = tf.float32)
+    
+            print_freq = tf.constant(print_freq, dtype = tf.int32)
             
             self.pre_training = True
             final_loss, stopped_epoch = self._compiled_training_loop_optimized(
@@ -1147,7 +1168,8 @@ class ModelNN(keras.models.Model):
                 reduce_lr_patience = reduce_lr_patience,
                 reduce_lr_cooldown = reduce_lr_cooldown,
                 reduce_lr_min_lr = reduce_lr_min_lr,
-                verbose = verbose
+                verbose = verbose,
+                print_freq = print_freq
             )
             self.pre_training = False
     
@@ -1781,9 +1803,9 @@ class ModelNN(keras.models.Model):
                 # ----------------------------------------------------------------------------------------------------------------------------------
             
                 # Flatten gradients to a single vector for easier Jacobian computation
-                # Suppose we have k+1 neurons on the last linear layer (actually, k neurons plus a bias term) and d outputs. Then:
-                # - The first group of k+1 weights will correspond to the weights to the first output
-                # - The second group of k+1 weights will correspond to the weights to the second output
+                # Suppose we have k neurons on the last linear layer and d outputs. Then:
+                # - The first group of k weights will correspond to the weights to the first output
+                # - The second group of k weights will correspond to the weights to the second output
                 grads_flat = tf.concat([tf.reshape(tf.transpose(g), [-1]) for g in grads], axis = 0)
                 
             hessian_batch = tape2.jacobian(grads_flat, vars_to_differentiate, experimental_use_pfor = False)
