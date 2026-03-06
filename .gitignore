@@ -6,6 +6,7 @@
 
 **/thetaflow.egg-info/
 **/build/
+**/dist/
 
 .Rhistory
 
