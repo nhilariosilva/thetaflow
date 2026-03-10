@@ -145,20 +145,11 @@ class ModelNN(keras.models.Model):
         self.configured = False
         self.training = False
         self.pre_training = False
-        self.current_epoch = 0
+        self.current_epoch = tf.Variable(0, dtype = tf.int32, trainable = False, name = "current_epoch")
         
         self.total_hessian = None
         self.weights_covariance = None
-
-        self.current_epoch = 0
-
-        # self.distances_norm = tf.Variable(0.0, dtype = tf.float32), trainable = False)
-        # self.distances_norm = self.add_weight(
-        #     name = "distances_norm",
-        #     initializer = "zeros",
-        #     trainable = False,
-        #     dtype = tf.float32
-        # )
+        
         self.previous_nn_predictions = None
         self.previous_independent_predictions = None
         
@@ -428,7 +419,7 @@ class ModelNN(keras.models.Model):
             nn_output_parameters[par] = par_values
         return nn_output_parameters
 
-    def get_variable(self, parameter, nn_output = None, force_true = False, get_raw_value = False, current_epoch = 0):
+    def get_variable(self, parameter, nn_output = None, get_raw_value = False, force_true = False, current_epoch = 0):
         """
             Once that all variables have been properly defined and mapped, this method uses their proper link functions to transform from
             the variables 'raw' state into their proper values used in the likelihood.
@@ -440,23 +431,6 @@ class ModelNN(keras.models.Model):
         raw_parameter = "raw_" + parameter
         # Filter the desired parameter from the list
         par = self.parameters[parameter]
-
-        par_has_warmup = "warmup_time" in par
-
-        # If model is training and user specified a warmup_time for the parameter, return its constant, initial value
-        # instead of the actual variable. That ensures the frozen variable will not be updated until a specific epoch
-        if(not force_true and self.training and par_has_warmup and epoch < par["warmup_time"]):
-            # VERIFY THIS CODE IN A ROBUST MANNER. THERE SEEMS TO BE MANY ISSUES WITH THIS SCHEME
-            if(get_raw_value):
-                par_value = tf.cast( par["link_inv"]( par["init"] ), dtype = tf.float32 )
-            else:
-                par_value = tf.cast( par["init"], dtype = tf.float32 )
-
-            # If the parameter corresponds to a neural network output, repeat its initial value the number of samples
-            if(nn_output is not None):
-                par_value = tf.tile(np.atleast_2d(par_value), (nn_output.shape[0], par["shape"]))
-                
-            return par_value
 
         # If nn_output is None, assume the parameter is independent from the data x and get it directly as a transformed weight
         if(nn_output is None):            
@@ -474,24 +448,46 @@ class ModelNN(keras.models.Model):
                     self._delta_tape.watch(par_value)
                     self._tracked_theta_tensors[parameter] = par_value
                 except:
-                    raise ValueError("tf.watch received a type Variable instead of tf.Tensor. Please, if you used lambda x : x as a link function, consider instead lambda x : tf.identity(x).")
+                    raise ValueError("tf.watch received a type Variable instead of tf.Tensor. Please, if you used lambda x : x as a link function, consider instead only tf.identity.")
                 
-            return par_value
-        
-        # If nn_output is not None, assume the parameter came as a neural network output and return it from its positions in the output
-        if(get_raw_value):
-            par_value = tf.gather(nn_output, self.vars_to_index[raw_parameter], axis = 1)
+            # return par_value
         else:
-            par_value = par["link"]( tf.gather(nn_output, self.vars_to_index[raw_parameter], axis = 1) )
+            # If nn_output is not None, assume the parameter came as a neural network output and return it from its positions in the output
+            if(get_raw_value):
+                par_value = tf.gather(nn_output, self.vars_to_index[raw_parameter], axis = 1)
+            else:
+                par_value = par["link"]( tf.gather(nn_output, self.vars_to_index[raw_parameter], axis = 1) )
+    
+            # If user is tracking a function for the Delta method (variable_function_covariance), track the final variable for Auto diff
+            if hasattr(self, '_delta_tape') and self._delta_tape is not None:
+                try:
+                    self._delta_tape.watch(par_value)
+                    self._tracked_theta_tensors[parameter] = par_value
+                except:
+                    raise(ValueError, "tf.watch received a type Variable instead of tf.Tensor. Please, use @tf.function functions only. For example, if you used lambda x : x as a link function, consider instead tf.identity.")
 
-        # If user is tracking a function for the Delta method (variable_function_covariance), track the final variable for Auto diff
-        if hasattr(self, '_delta_tape') and self._delta_tape is not None:
-            try:
-                self._delta_tape.watch(par_value)
-                self._tracked_theta_tensors[parameter] = par_value
-            except:
-                raise(ValueError, "tf.watch received a type Variable instead of tf.Tensor. Please, use @tf.function functions only. For example, if you used lambda x : x as a link function, consider instead tf.identity.")
-        
+        par_has_warmup = "warmup_time" in par
+        # If model is training and user specified a warmup_time for the parameter, return its constant, initial value
+        # instead of the actual variable. That ensures the frozen variable will not be updated until a specific epoch
+        if(not force_true and self.training and par_has_warmup and par["warmup_time"] > 0):
+
+            # Force warmup_time to be a Tensor so the comparison happens in the graph
+            warmup_tensor = tf.constant(par["warmup_time"], dtype = tf.int32)
+            # if(get_raw_value):
+            #     par_value = tf.cast( par["link_inv"]( par["init"] ), dtype = tf.float32 )
+            # else:
+            #     par_value = tf.cast( par["init"], dtype = tf.float32 )
+
+            # # If the parameter corresponds to a neural network output, repeat its initial value the number of samples
+            # if(nn_output is not None):
+            #     par_value = tf.tile(np.atleast_2d(par_value), (nn_output.shape[0], par["shape"]))
+
+            par_value = tf.cond(
+                tf.math.less(self.current_epoch, warmup_tensor),
+                lambda: tf.stop_gradient(par_value),
+                lambda: par_value
+            )
+            
         return par_value
 
     @tf.function
@@ -671,7 +667,9 @@ class ModelNN(keras.models.Model):
         # distances_history = tf.TensorArray(dtype = tf.float32, size = epochs, dynamic_size = False)
         
         for epoch in tf.range(epochs):
-
+            
+            self.current_epoch.assign( tf.cast(epoch, tf.int32) )
+            
             # ------------------------------------------------ Shuffle data at the start of each epoch, if desired ------------------------------------------------
             if(shuffle):
                 indices = tf.random.shuffle( tf.range(n_samples) )
@@ -710,9 +708,19 @@ class ModelNN(keras.models.Model):
                         loss_value = self.loglikelihood_loss_pretrain(nn_output = nn_output_batch, data = batch_full_data)
                     else:
                         loss_value = self.loglikelihood_loss(self, nn_output = nn_output_batch, data = batch_full_data)
-
+                
                 gradients = tape.gradient(loss_value, self.trainable_variables)
 
+                
+                # Gradient trap: Check if any gradient in the entire network became NaN or Inf
+                has_nan_grad = tf.reduce_any([tf.reduce_any(tf.math.is_nan(g)) for g in gradients if g is not None])
+                has_inf_grad = tf.reduce_any([tf.reduce_any(tf.math.is_inf(g)) for g in gradients if g is not None])
+        
+                if tf.math.logical_or(has_nan_grad, has_inf_grad):
+                    tf.print("\n[!] FATAL: Gradients exploded to NaN/Inf at Epoch:", epoch)
+                    stop_training = True
+                    break # Halt before the optimizer poisons the weights
+                
                 # To avoid crash problems in that case, we simply replace None with a zero like gradient, so those weights do not get updated
                 # It is the user's responsibility to build a loss that depends on all the trainable parameters, but we allow that to happen in this case
                 # for generality and to avoid unneccessary crashes when testing new models
@@ -756,7 +764,7 @@ class ModelNN(keras.models.Model):
             # --------------------------------------------------------------- Evaluate stop criteria ---------------------------------------------------------------
             # For comparisons we will be using the raw value in order to avoid potential link functions exponential explosions
             # Get the independent parameters predictions
-
+                
             if(epoch % metrics_update_freq == 0 and epoch > 0):
                 if(self.independent_pars_use):
                     new_independent_predictions = [self.get_variable(par, get_raw_value = True) for par in self.independent_pars]
@@ -894,9 +902,9 @@ class ModelNN(keras.models.Model):
                         )
                 # --------------------------------------------------------------------------------------------------------------------------------------------------
                 
-                # Stop if converged
-                if stop_training:
-                    break
+            # Stop if converged or an error occurred
+            if stop_training:
+                break
 
         # For a tf.TensorArray we must stack its values before finally returning it as a Tensor
         # final_distances_tensor = distances_history.stack()
@@ -940,6 +948,9 @@ class ModelNN(keras.models.Model):
             self.optimizer_independent.build( self.trainable_variables[:len(self.independent_pars)] )
         if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
             self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
+
+        independent_learning_rate = tf.identity( optimizer_independent.learning_rate )
+        nn_learning_rate = tf.identity( optimizer_nn.learning_rate )
         
         epochs = tf.constant(epochs, dtype = tf.int32)
         metrics_update_freq = tf.constant(metrics_update_freq, dtype = tf.int32)
@@ -999,6 +1010,15 @@ class ModelNN(keras.models.Model):
         )
         self.training = False
 
+        # Resets the optimizers
+        if(self.independent_pars_use):
+            self.optimizer_independent.learning_rate = independent_learning_rate
+            self.optimizer_independent.build( self.trainable_variables[:len(self.independent_pars)] )
+        if(self.neural_network_use):
+            print('Updating nn learning rate', nn_learning_rate)
+            self.optimizer_nn.learning_rate = nn_learning_rate
+            self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
+    
         if(verbose):
             print("\nDone.")
 
@@ -1006,6 +1026,8 @@ class ModelNN(keras.models.Model):
         if(fine_tune and self.neural_network_use):
             if(verbose):
                 print("Initializing model fine tuning (only independent parameters and last-layer)")
+                print(self.optimizer_independent.learning_rate)
+                print(self.optimizer_nn.learning_rate)
             # Format the input data accordingly and prepare training and validation datasets
             self.config_training(x, data,
                                  shuffle,
@@ -1043,6 +1065,10 @@ class ModelNN(keras.models.Model):
                 verbose = verbose,
                 print_freq = print_freq
             )
+
+            self.optimizer_independent.learning_rate = independent_learning_rate
+            self.optimizer_nn.learning_rate = nn_learning_rate
+            
             if(verbose):
                 print("\nDone.")
         
@@ -1118,6 +1144,9 @@ class ModelNN(keras.models.Model):
         # To do that, we settle a custom loss function with quadratic error around the initial values (self.loglikelihood_loss_pretrain)
         # Using that loss function, the model tries to approximate the initial value, although its geometry may be hard to approximate it from its weights
         else:
+            independent_learning_rate = optimizer_independent.learning_rate
+            nn_learning_rate = optimizer_nn.learning_rate
+            
             if(deterministic):
                 # If GPU is being considered and user want deterministic behaviour, it is neccessary to activate
                 # tf.config.experimental.enable_op_determinism()
@@ -1130,7 +1159,7 @@ class ModelNN(keras.models.Model):
             else:
                 set_global_seed(seed = None, verbose = verbose)
 
-                # Force the optimizers to build their state variables in Python so they don't try to create them inside the C++ when function is called a second time
+            # Force the optimizers to build their state variables in Python so they don't try to create them inside the C++ when function is called a second time
             if self.independent_pars_use and not getattr(self.optimizer_independent, 'built', False):
                 self.optimizer_independent.build( self.trainable_variables[:len(self.independent_pars)] )
             if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
@@ -1172,6 +1201,9 @@ class ModelNN(keras.models.Model):
                 print_freq = print_freq
             )
             self.pre_training = False
+
+            self.optimizer_independent.learning_rate = independent_learning_rate
+            self.optimizer_nn.learning_rate = nn_learning_rate
     
     def config_training(self, x, data,
                         shuffle = True,
