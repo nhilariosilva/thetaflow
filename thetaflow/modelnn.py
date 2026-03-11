@@ -391,7 +391,7 @@ class ModelNN(keras.models.Model):
     def call(self, x_input, training = True):
         if(self.neural_network_call is None):
             return None
-        x = self.neural_network_call(self, x_input)
+        x = self.neural_network_call(self, x_input, training = training)
         return x
         # if(training):
         #     return x
