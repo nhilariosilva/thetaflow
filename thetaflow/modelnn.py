@@ -611,6 +611,7 @@ class ModelNN(keras.models.Model):
                                           reduce_lr_cooldown = tf.constant(0, dtype = tf.int32),
                                           reduce_lr_min_lr = tf.constant(5e-4, dtype = tf.float32),
                                           deterministic = True,
+                                          pre_training = False,
                                           verbose = True, print_freq = tf.constant(100, dtype = tf.int32)):
         """
             Executes the entire optimization loop purely in C++.
@@ -630,6 +631,7 @@ class ModelNN(keras.models.Model):
         # Set up history variables to track convergence profile
         num_checkups = epochs // metrics_update_freq
         history_index = 0
+        loss_history = tf.TensorArray(tf.float32, size = epochs, clear_after_read = False)
         independent_distance_history = tf.TensorArray(tf.float32, size = num_checkups, element_shape=(self.independent_output_size, ), clear_after_read = False)
         nnmax_distance_history = tf.TensorArray(tf.float32, size = num_checkups, element_shape=(self.nn_output_size, ), clear_after_read = False)
 
@@ -713,11 +715,13 @@ class ModelNN(keras.models.Model):
                 with tf.GradientTape() as tape:
                     nn_output_batch = self(x_batch, training = True)
                     
-                    if self.pre_training:
+                    if(pre_training):
                         loss_value = self.loglikelihood_loss_pretrain(nn_output = nn_output_batch, data = batch_full_data)
                     else:
                         loss_value = self.loglikelihood_loss(self, nn_output = nn_output_batch, data = batch_full_data)
 
+                    loss_history = loss_history.write(epoch, loss_value)
+                                      
                     # Automatic regularization from layer definitions
                     # Check if any layer in the model generated a regularization loss
                     if(self.losses):
@@ -736,6 +740,12 @@ class ModelNN(keras.models.Model):
         
                 if tf.math.logical_or(has_nan_grad, has_inf_grad):
                     tf.print("\n[!] FATAL: Gradients exploded to NaN/Inf at Epoch:", epoch)
+
+                    # lam_batch = self.get_variable("lam", nn_output_batch)
+                    # rho_batch = self.get_variable("rho", nn_output_batch)
+                    
+                    # tf.print("-> LAST SAFE lam (min | max):", tf.reduce_min(lam_batch), "|", tf.reduce_max(lam_batch))
+                    # tf.print("-> LAST SAFE rho (min | max):", tf.reduce_min(rho_batch), "|", tf.reduce_max(rho_batch))
                     
                     stop_training = True
                     break # Halt before the optimizer poisons the weights
@@ -960,10 +970,11 @@ class ModelNN(keras.models.Model):
 
         final_epoch = epoch
 
+        loss_history = loss_history.stack()
         independent_distance_history = independent_distance_history.stack()
         nnmax_distance_history = nnmax_distance_history.stack()
         
-        return final_loss, final_epoch, independent_distance_history, nnmax_distance_history
+        return final_loss, final_epoch, loss_history, independent_distance_history, nnmax_distance_history
     
     def train_model(self, x, data,
                     epochs, shuffle,
@@ -993,9 +1004,11 @@ class ModelNN(keras.models.Model):
                              verbose)
         
         # Force the optimizers to build their state variables in Python so they don't try to create them inside the C++ when function is called a second time
-        if self.independent_pars_use and not getattr(self.optimizer_independent, 'built', False):
+        # if self.independent_pars_use and not getattr(self.optimizer_independent, 'built', False):
+        if(self.independent_pars_use):
             self.optimizer_independent.build( self.trainable_variables[:len(self.independent_pars)] )
-        if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
+        # if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
+        if(self.neural_network_use):
             self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
 
         independent_learning_rate = tf.identity( optimizer_independent.learning_rate )
@@ -1037,7 +1050,7 @@ class ModelNN(keras.models.Model):
         
         self.training = True
         # Compiled training routine
-        final_loss, stopped_epoch, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
+        final_loss, last_epoch, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
             self.x_train,
             self.data_train,
             epochs,
@@ -1056,11 +1069,14 @@ class ModelNN(keras.models.Model):
             reduce_lr_cooldown = reduce_lr_cooldown,
             reduce_lr_min_lr = reduce_lr_min_lr,
             deterministic = deterministic,
+            pre_training = False,
             verbose = verbose,
             print_freq = print_freq
         )
         self.training = False
 
+        self.last_epoch = last_epoch
+        self.loss_history = loss_history
         self.independent_distance_history = independent_distance_history
         self.nnmax_distance_history = nnmax_distance_history
         
@@ -1097,7 +1113,7 @@ class ModelNN(keras.models.Model):
             # Redefine the gradients accumulation objects
             self.define_gradients()
 
-            final_loss, stopped_epoch, independent_distance_history_finetune, nnmax_distance_history_finetune = self._compiled_training_loop_optimized(
+            final_loss, last_epoch, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
                 self.x_train,
                 self.data_train,
                 epochs,
@@ -1116,12 +1132,15 @@ class ModelNN(keras.models.Model):
                 reduce_lr_cooldown = reduce_lr_cooldown,
                 reduce_lr_min_lr = reduce_lr_min_lr,
                 deterministic = deterministic,
+                pre_training = False,
                 verbose = verbose,
                 print_freq = print_freq
             )
 
-            self.independent_distance_history_finetune = independent_distance_history_finetune
-            self.nnmax_distance_history_finetune = nnmax_distance_history_finetune
+            self.last_epoch_finetune = last_epoch
+            self.loss_history_finetune = loss_history
+            self.independent_distance_history_finetune = independent_distance_history
+            self.nnmax_distance_history_finetune = nnmax_distance_history
             
             self.optimizer_independent.learning_rate = independent_learning_rate
             self.optimizer_nn.learning_rate = nn_learning_rate
@@ -1151,8 +1170,8 @@ class ModelNN(keras.models.Model):
                         buffer_size = 4096, gradient_accumulation_steps = None,
                         early_stopping = True, early_stopping_tolerance = 1.0e-6, early_stopping_warmup = 100,
                         so_early_stopping_tolerance = 1.0e-3,
-                        reduce_lr = True, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10, reduce_lr_cooldown = 0,
-                        reduce_lr_min_lr = 5e-4,
+                        reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10,
+                        reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                         deterministic = True,
                         verbose = True, print_freq = 100, track_time = True):
         
@@ -1218,9 +1237,11 @@ class ModelNN(keras.models.Model):
                 set_global_seed(seed = None, verbose = verbose)
 
             # Force the optimizers to build their state variables in Python so they don't try to create them inside the C++ when function is called a second time
-            if self.independent_pars_use and not getattr(self.optimizer_independent, 'built', False):
+            # if self.independent_pars_use and not getattr(self.optimizer_independent, 'built', False):
+            if(self.independent_pars_use):
                 self.optimizer_independent.build( self.trainable_variables[:len(self.independent_pars)] )
-            if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
+            # if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
+            if(self.neural_network_use):
                 self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
             
             epochs = tf.constant(epochs, dtype = tf.int32)
@@ -1240,7 +1261,7 @@ class ModelNN(keras.models.Model):
             print_freq = tf.constant(print_freq, dtype = tf.int32)
             
             self.pre_training = True
-            final_loss, stopped_epoch, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
+            final_loss, last_epoch, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
                 self.x_train,
                 self.data_train,
                 epochs,
@@ -1252,15 +1273,23 @@ class ModelNN(keras.models.Model):
                 early_stopping_warmup = early_stopping_warmup,
                 so_early_stopping_tolerance = so_early_stopping_tolerance,
                 reduce_lr = reduce_lr,
+                reduce_lr_warmup = reduce_lr_warmup,
                 reduce_lr_factor = reduce_lr_factor,
                 reduce_lr_min_delta = reduce_lr_min_delta,
                 reduce_lr_patience = reduce_lr_patience,
                 reduce_lr_cooldown = reduce_lr_cooldown,
                 reduce_lr_min_lr = reduce_lr_min_lr,
+                deterministic = deterministic,
+                pre_training = True,
                 verbose = verbose,
                 print_freq = print_freq
             )
             self.pre_training = False
+
+            self.last_epoch_pretrain = last_epoch
+            self.loss_history_pretrain = loss_history
+            self.independent_distance_history_pretrain = independent_distance_history
+            self.nnmax_distance_history_pretrain = nnmax_distance_history
 
             self.optimizer_independent.learning_rate = independent_learning_rate
             self.optimizer_nn.learning_rate = nn_learning_rate
