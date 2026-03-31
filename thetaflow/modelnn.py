@@ -600,14 +600,14 @@ class ModelNN(keras.models.Model):
                                           shuffle = True,
                                           metrics_update_freq = tf.constant(1, dtype = tf.int32),
                                           early_stopping = True,
+                                          early_stopping_patience = tf.constant(10, dtype = tf.int32),
                                           early_stopping_tolerance = tf.constant(1.0e-6, dtype = tf.float32),
                                           early_stopping_warmup = tf.constant(0, dtype = tf.int32),
-                                          so_early_stopping_tolerance = tf.constant(1.0e-3, dtype = tf.float32),
                                           reduce_lr = True,
                                           reduce_lr_warmup = tf.constant(0, dtype = tf.int32),
                                           reduce_lr_factor = tf.constant(0.5, dtype = tf.float32),
                                           reduce_lr_min_delta = tf.constant(0.0, dtype = tf.float32),
-                                          reduce_lr_patience = tf.constant(10, dtype = tf.int32),
+                                          reduce_lr_patience = tf.constant(5, dtype = tf.int32),
                                           reduce_lr_cooldown = tf.constant(0, dtype = tf.int32),
                                           reduce_lr_min_lr = tf.constant(5e-4, dtype = tf.float32),
                                           deterministic = True,
@@ -624,7 +624,6 @@ class ModelNN(keras.models.Model):
         stop_training = False
         lr_independent = self.optimizer_independent.learning_rate
         lr_nn = self.optimizer_nn.learning_rate
-        minimal_lr_achieved = False
         
         distances_norm = tf.constant(float('inf'), dtype = tf.float32)
 
@@ -658,8 +657,6 @@ class ModelNN(keras.models.Model):
             new_nn_predictions = tf.concat(nn_predictions, axis = -1)
             previous_nn_predictions = new_nn_predictions
 
-        previous_distances_norm = tf.constant(0.0, dtype = tf.float32)
-
         # Run an initial forward pass to get baseline nn predictions
         # initial_nn_output = self(x_full, training = False) if self.neural_network_use else None
         # prev_nn_preds = tf.concat([self.get_variable(par, initial_nn_output, get_raw_value=True) for par in self.nn_pars], axis=-1) if self.neural_network_use else tf.constant([[]], dtype=tf.float32)
@@ -667,15 +664,21 @@ class ModelNN(keras.models.Model):
         n_samples = tf.shape(data_full[0])[0]
 
         # ReduceLROnPlateau routine variables
-        # if(reduce_lr):
+        # Reduce learning rate wait
         lr_wait = tf.constant(0, dtype = tf.int32)
+        # Early stopping wait
+        es_wait = tf.constant(0, dtype = tf.int32)
         lr_cooldown_counter = tf.constant(0, dtype = tf.int32)
         best_metric = tf.constant(float('inf'), dtype = tf.float32)
         new_lr_ind = tf.constant(0.0, dtype = tf.float32)
         new_lr_nn = tf.constant(0.0, dtype = tf.float32)
 
-        # Tracking distances along each epoch
-        # distances_history = tf.TensorArray(dtype = tf.float32, size = epochs, dynamic_size = False)
+        # Before your loop starts (e.g., epoch 0)
+        best_weights = [tf.identity(w) for w in self.trainable_variables]
+
+        # By default, if convergence_reason does not change during training, that's because the algorithm reached the final
+        # epoch without ever converging
+        convergence_reason = "all_epochs"
         
         for epoch in tf.range(epochs):
             
@@ -731,22 +734,14 @@ class ModelNN(keras.models.Model):
                         loss_value = loss_value + regularization_penalty
                 
                 gradients = tape.gradient(loss_value, self.trainable_variables)
-                # Clip gradients to avoid parameter explosions - TEST IT WITH MULTIPLE DATASETS!!!
-                clipped_gradients, _ = tf.clip_by_global_norm(gradients, clip_norm = 1.0)
-
+    
                 # Gradient trap: Check if any gradient in the entire network became NaN or Inf
                 has_nan_grad = tf.reduce_any([tf.reduce_any(tf.math.is_nan(g)) for g in gradients if g is not None])
                 has_inf_grad = tf.reduce_any([tf.reduce_any(tf.math.is_inf(g)) for g in gradients if g is not None])
         
                 if tf.math.logical_or(has_nan_grad, has_inf_grad):
                     tf.print("\n[!] FATAL: Gradients exploded to NaN/Inf at Epoch:", epoch)
-
-                    # lam_batch = self.get_variable("lam", nn_output_batch)
-                    # rho_batch = self.get_variable("rho", nn_output_batch)
-                    
-                    # tf.print("-> LAST SAFE lam (min | max):", tf.reduce_min(lam_batch), "|", tf.reduce_max(lam_batch))
-                    # tf.print("-> LAST SAFE rho (min | max):", tf.reduce_min(rho_batch), "|", tf.reduce_max(rho_batch))
-                    
+                    convergence_reason = "nan_gradients"
                     stop_training = True
                     break # Halt before the optimizer poisons the weights
                 
@@ -806,9 +801,6 @@ class ModelNN(keras.models.Model):
                     nn_predictions = [nn_pars_predictions[par] for par in nn_pars_predictions]
                     # Concatenate all neural network outputs into a single matrix
                     new_nn_predictions = tf.concat(nn_predictions, axis = -1)
-    
-                # tf.print("new inde pred", new_independent_predictions)
-                # tf.print("new nn pred", new_nn_predictions)
 
                 if(self.independent_pars_use and self.neural_network_use):
                     independent_distances = ( (new_independent_predictions - previous_independent_predictions)/(tf.math.abs(previous_independent_predictions) + 1.0) )**2
@@ -821,54 +813,33 @@ class ModelNN(keras.models.Model):
                     # Concatenate all distances into a single array and take its norm
                     all_distances = tf.concat([independent_distances, nn_distances], axis = 0)
                     distances_norm = tf.math.sqrt( tf.reduce_sum(all_distances) )
-                    
-                    if(early_stopping and epoch > early_stopping_warmup):
-                        # If the distances norm by itself or the difference between the distance taken in the last checkup and the one takes here is small enough
-                        # We consider the model has converged. Note that the distance of distances counts as a second order convergence
-                        # If the model converged to a local minima, but the learning rate did not have the chance to be reduced to the right value
-                        # we detect whether the oscilations are the same. If they are, probably the fluctuation is simply due to the high learning rate
-                        if((distances_norm < early_stopping_tolerance) or (tf.math.abs(previous_distances_norm - distances_norm) < so_early_stopping_tolerance)):
-                            if(verbose):
-                                tf.print("\nStopping. Model has converged at epoch", epoch)
-                            stop_training = True
-
                     previous_nn_predictions = new_nn_predictions
                     previous_independent_predictions = new_independent_predictions
-                    
-
                 elif(self.independent_pars_use):
                     independent_distances = ( (new_independent_predictions - previous_independent_predictions)/(tf.math.abs(previous_independent_predictions) + 1.0) )**2
                     independent_distance_history = independent_distance_history.write(history_index, independent_distances)
                     
                     distances_norm = tf.math.sqrt( tf.reduce_sum(independent_distances) )
-                    
-                    if(early_stopping and epoch > early_stopping_warmup):
-                        if((distances_norm < early_stopping_tolerance) or (tf.math.abs(previous_distances_norm - distances_norm) < so_early_stopping_tolerance)):
-                            if(verbose):
-                                tf.print("\nStopping. Model has converged at epoch", epoch)
-                            stop_training = True
-                    
                     previous_independent_predictions = new_independent_predictions
                 else:
                     nn_distances = tf.reduce_max( ( (new_nn_predictions - previous_nn_predictions) / (tf.math.abs(previous_nn_predictions) + 1.0) )**2, axis = 0 )
                     nnmax_distance_history = nnmax_distance_history.write(history_index, nn_distances)
                     
                     distances_norm = tf.math.sqrt( tf.reduce_sum(nn_distances) )
-                    
-                    if(early_stopping and epoch > early_stopping_warmup):
-                        if( (distances_norm < early_stopping_tolerance) or (tf.math.abs(previous_distances_norm - distances_norm) < so_early_stopping_tolerance) ):
-                            if(verbose):
-                                tf.print("\nStopping. Model has converged at epoch", epoch)
-                            stop_training = True
                     previous_nn_predictions = new_nn_predictions
 
-                previous_distances_norm = distances_norm
-                
+                if(early_stopping and epoch > early_stopping_warmup):
+                    if( distances_norm < early_stopping_tolerance ):
+                        if(verbose):
+                            tf.print("\nConvergence criterion reached. Stopping.")
+                        convergence_reason = "minimal_tolerance"
+                        stop_training = True
+                        
                 history_index += 1
                 # distances_history = distances_history.write(epoch, distances_norm)
 
                 # ------------------------------------ ReduceLROnPlateau custom mechanism. Hard-coded implementation needed for performance issues ------------------------------------
-                if(reduce_lr and epoch > reduce_lr_warmup):
+                if((reduce_lr or early_stopping) and epoch > reduce_lr_warmup):
                     # Reconstruct full_data for the loss function
                     batch_full_data = (x_full,) + tuple(data_full)
                     
@@ -886,11 +857,14 @@ class ModelNN(keras.models.Model):
                         # Check if the loss improved by at least the min_delta
                         if(current_loss < (best_metric - reduce_lr_min_delta)):
                             best_metric = current_loss
+                            best_weights = [tf.identity(w) for w in self.trainable_variables]
                             lr_wait = tf.constant(0, dtype = tf.int32)
+                            es_wait = tf.constant(0, dtype = tf.int32)
                         else:
                             lr_wait = lr_wait + 1
+                            es_wait = es_wait + 1
                             
-                            if(lr_wait >= reduce_lr_patience):
+                            if(reduce_lr and lr_wait >= reduce_lr_patience):
                                 # Decay the learning rates
                                 if(self.independent_pars_use):
                                     old_lr_ind = self.optimizer_independent.learning_rate
@@ -901,21 +875,28 @@ class ModelNN(keras.models.Model):
                                     old_lr_nn = self.optimizer_nn.learning_rate
                                     new_lr_nn = tf.maximum(old_lr_nn * reduce_lr_factor, reduce_lr_min_lr)
                                     self.optimizer_nn.learning_rate.assign(new_lr_nn)
-                                    
+
+                                # If minimum learning rate is reached, stop training
+                                if( early_stopping and (tf.equal(new_lr_ind, reduce_lr_min_lr) or tf.equal(new_lr_nn, reduce_lr_min_lr)) ):
+                                    convergence_reason = "minimal_learning_rate"
+                                    stop_training = True
+                                
                                 # Reset counters
                                 lr_cooldown_counter = reduce_lr_cooldown
                                 lr_wait = tf.constant(0, dtype = tf.int32)
 
-                                if verbose:
-                                    # Print a newline first so it doesn't break your progress bar
-                                    # tf.print("\n[ReduceLROnPlateau] Epoch ", epoch, " - Loss plateaued. Reducing LR.")
-                                    pass
+                            # If it has passed early_stopping_patience epochs with no improvement in the loss function, halts training
+                            if(early_stopping and es_wait >= early_stopping_patience):
+                                if(verbose):
+                                    tf.print("\nConvergence criterion reached. Stopping.")
+                                self.set_weights(best_weights)
+                                
+                                for i, w in enumerate(self.trainable_variables):
+                                    w.assign(best_weights[i])
 
-                            # If minimum learning rate is reached, stop training
-                            if( early_stopping and (tf.equal(new_lr_ind, reduce_lr_min_lr) or tf.equal(new_lr_nn, reduce_lr_min_lr)) and (not minimal_lr_achieved) ):
-                                # tf.print("\nMinimal learning rate achieved on epoch", epoch, ".")
-                                minimal_lr_achieved = True
+                                convergence_reason = "loss_improvement"
                                 stop_training = True
+                        
                 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
                 
                 # --------------------------------------------- Native progress tracker without great performance lose ---------------------------------------------
@@ -974,7 +955,7 @@ class ModelNN(keras.models.Model):
         independent_distance_history = independent_distance_history.stack()
         nnmax_distance_history = nnmax_distance_history.stack()
         
-        return final_loss, final_epoch, loss_history, independent_distance_history, nnmax_distance_history
+        return final_loss, final_epoch, convergence_reason, loss_history, independent_distance_history, nnmax_distance_history
     
     def train_model(self, x, data,
                     epochs, shuffle,
@@ -986,9 +967,8 @@ class ModelNN(keras.models.Model):
                     optimizer_nn = optimizers.Adam(learning_rate = 0.001),
                     train_batch_size = None, val_batch_size = None,
                     buffer_size = 4096, gradient_accumulation_steps = None,
-                    early_stopping = True, early_stopping_tolerance = 1.0e-6, early_stopping_warmup = 100,
-                    so_early_stopping_tolerance = 1.0e-3,
-                    reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10,
+                    early_stopping = True, early_stopping_patience = 10, early_stopping_tolerance = 1.0e-6, early_stopping_warmup = 100,
+                    reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 5,
                     reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                     deterministic = True,
                     verbose = True, print_freq = 100, track_time = True):
@@ -1016,9 +996,9 @@ class ModelNN(keras.models.Model):
         
         epochs = tf.constant(epochs, dtype = tf.int32)
         metrics_update_freq = tf.constant(metrics_update_freq, dtype = tf.int32)
-        
+
+        early_stopping_patience = tf.constant(early_stopping_patience, dtype = tf.int32)
         early_stopping_tolerance = tf.constant(early_stopping_tolerance, dtype = tf.float32)
-        so_early_stopping_tolerance = tf.constant(so_early_stopping_tolerance, dtype = tf.float32)
         early_stopping_warmup = tf.constant(early_stopping_warmup, dtype = tf.int32)
 
         reduce_lr_warmup = tf.constant(reduce_lr_warmup, dtype = tf.int32)
@@ -1050,7 +1030,7 @@ class ModelNN(keras.models.Model):
         
         self.training = True
         # Compiled training routine
-        final_loss, last_epoch, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
+        final_loss, last_epoch, convergence_reason, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
             self.x_train,
             self.data_train,
             epochs,
@@ -1058,9 +1038,9 @@ class ModelNN(keras.models.Model):
             shuffle = shuffle,
             metrics_update_freq = metrics_update_freq,
             early_stopping = early_stopping,
+            early_stopping_patience = early_stopping_patience,
             early_stopping_tolerance = early_stopping_tolerance,
             early_stopping_warmup = early_stopping_warmup,
-            so_early_stopping_tolerance = so_early_stopping_tolerance,
             reduce_lr = reduce_lr,
             reduce_lr_warmup = reduce_lr_warmup,
             reduce_lr_factor = reduce_lr_factor,
@@ -1077,6 +1057,7 @@ class ModelNN(keras.models.Model):
 
         self.last_epoch = last_epoch
         self.loss_history = loss_history
+        self.convergence_reason = convergence_reason
         self.independent_distance_history = independent_distance_history
         self.nnmax_distance_history = nnmax_distance_history
         
@@ -1113,7 +1094,7 @@ class ModelNN(keras.models.Model):
             # Redefine the gradients accumulation objects
             self.define_gradients()
 
-            final_loss, last_epoch, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
+            final_loss, last_epoch, convergence_reason, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
                 self.x_train,
                 self.data_train,
                 epochs,
@@ -1121,9 +1102,9 @@ class ModelNN(keras.models.Model):
                 shuffle = shuffle,
                 metrics_update_freq = metrics_update_freq,
                 early_stopping = early_stopping,
+                early_stopping_patience = early_stopping_patience,
                 early_stopping_tolerance = early_stopping_tolerance,
                 early_stopping_warmup = early_stopping_warmup,
-                so_early_stopping_tolerance = so_early_stopping_tolerance,
                 reduce_lr = reduce_lr,
                 reduce_lr_warmup = reduce_lr_warmup,
                 reduce_lr_factor = reduce_lr_factor,
@@ -1139,6 +1120,7 @@ class ModelNN(keras.models.Model):
 
             self.last_epoch_finetune = last_epoch
             self.loss_history_finetune = loss_history
+            self.convergence_reason_finetune = convergence_reason
             self.independent_distance_history_finetune = independent_distance_history
             self.nnmax_distance_history_finetune = nnmax_distance_history
             
@@ -1168,9 +1150,8 @@ class ModelNN(keras.models.Model):
                         optimizer_nn = optimizers.Adam(learning_rate = 0.001),
                         train_batch_size = None, val_batch_size = None,
                         buffer_size = 4096, gradient_accumulation_steps = None,
-                        early_stopping = True, early_stopping_tolerance = 1.0e-6, early_stopping_warmup = 100,
-                        so_early_stopping_tolerance = 1.0e-3,
-                        reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10,
+                        early_stopping = True, early_stopping_patience = 10, early_stopping_tolerance = 1.0e-6, early_stopping_warmup = 100,
+                        reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 5,
                         reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                         deterministic = True,
                         verbose = True, print_freq = 100, track_time = True):
@@ -1246,9 +1227,9 @@ class ModelNN(keras.models.Model):
             
             epochs = tf.constant(epochs, dtype = tf.int32)
             metrics_update_freq = tf.constant(metrics_update_freq, dtype = tf.int32)
-            
+
+            early_stopping_patience = tf.constant(early_stopping_patience, dtype = tf.int32)
             early_stopping_tolerance = tf.constant(early_stopping_tolerance, dtype = tf.float32)
-            so_early_stopping_tolerance = tf.constant(so_early_stopping_tolerance, dtype = tf.float32)
             early_stopping_warmup = tf.constant(early_stopping_warmup, dtype = tf.int32)
     
             reduce_lr_warmup = tf.constant(reduce_lr_warmup, dtype = tf.int32)
@@ -1261,7 +1242,7 @@ class ModelNN(keras.models.Model):
             print_freq = tf.constant(print_freq, dtype = tf.int32)
             
             self.pre_training = True
-            final_loss, last_epoch, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
+            final_loss, last_epoch, convergence_reason, loss_history, independent_distance_history, nnmax_distance_history = self._compiled_training_loop_optimized(
                 self.x_train,
                 self.data_train,
                 epochs,
@@ -1269,9 +1250,9 @@ class ModelNN(keras.models.Model):
                 shuffle = shuffle,
                 metrics_update_freq = metrics_update_freq,
                 early_stopping = early_stopping,
+                early_stopping_patience = early_stopping_patience,
                 early_stopping_tolerance = early_stopping_tolerance,
                 early_stopping_warmup = early_stopping_warmup,
-                so_early_stopping_tolerance = so_early_stopping_tolerance,
                 reduce_lr = reduce_lr,
                 reduce_lr_warmup = reduce_lr_warmup,
                 reduce_lr_factor = reduce_lr_factor,
@@ -1288,6 +1269,7 @@ class ModelNN(keras.models.Model):
 
             self.last_epoch_pretrain = last_epoch
             self.loss_history_pretrain = loss_history
+            self.convergence_reason_pretrain = convergence_reason
             self.independent_distance_history_pretrain = independent_distance_history
             self.nnmax_distance_history_pretrain = nnmax_distance_history
 
@@ -1630,7 +1612,7 @@ class ModelNN(keras.models.Model):
                         train_batch_size = None, val_batch_size = None,
                         buffer_size = 4096, gradient_accumulation_steps = None,
                         early_stopping = True, early_stopping_min_delta = 0.0, early_stopping_patience = 10, early_stopping_warmup = 0,
-                        reduce_lr = True, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 10, reduce_lr_cooldown = 0,
+                        reduce_lr = True, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 3, reduce_lr_cooldown = 0,
                         reduce_lr_min_lr = 5e-4,
                         run_eagerly = False, verbose = 1):
 
