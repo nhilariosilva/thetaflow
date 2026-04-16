@@ -1,0 +1,19 @@
+Dev Log: April 15, 2026
+
+- Added force_training_validation toggle: Introduced a boolean argument in the training routine that forces the early stopping and learning rate schedulers to evaluate the training data, even if validation data is provided. This is primarily a backend utility to support the fine-tuning step, ensuring the optimizer strictly targets a local maximum on the training manifold.
+
+- Decoupled Fine-Tuning Hyperparameters: Added fine-tune-specific arguments for warmups, patience, and tolerances. When transitioning to fine-tuning, the geometry of the model drastically collapses from thousands of deep learning weights down to a few dozen statistical parameters. Isolating these hyperparameters ensures the optimizer navigates this strictly convex space correctly to achieve the stable Hessian required for valid standard errors.
+
+- Enforced Full-Batch Gradient Descent for Fine-Tuning: thetaflow now automatically intercepts and overrides user batching arguments (fixing train_batch_size and gradient_accumulation_steps to 1 batch) when fine_tune = True. This eliminates stochastic mini-batch noise, protecting users from accidentally halting on a sloped gradient and generating mathematically invalid covariance matrices.
+
+- Resolved the "Ghost Seed" Initialization Bug: Moved the global seed and op-determinism lockdown directly into the ModelNN.__init__ method, executing right before the layers and independent parameters are built. This fixes an issue where a fresh kernel's first execution yielded a different random state than all subsequent reruns, guaranteeing perfect weight reproducibility from the exact moment the object is instantiated.
+
+- Included training loss into final epoch evaluation, so that the loss history for both train and validation do not depend on training randomness, since there they
+are evaluated with training = False.
+
+- Included a restriction that tracks the best metric in training only after the early_stopping_warmup has been overcame. That avoids that an early stage degeneracy that was unstable, but might have presented low losser values get selected over a stable, slightly higher loss region reached after model proper convergence
+
+- Fixed problems in training weight recovering. Now the final model weights correspond to the best observed epoch after the warmup period
+
+- Implemented a return variable in the training routine to track the best metric and the epoch where that happened
+
