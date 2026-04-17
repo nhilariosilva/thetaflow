@@ -17,3 +17,8 @@ are evaluated with training = False.
 
 - Implemented a return variable in the training routine to track the best metric and the epoch where that happened
 
+Dev Log: April 17, 2026
+
+- Added self.best_weights initialization in pre_train_model function (BUG)
+- Switched best weights from tracking self.trainable_variables to track self.variables. That way it can track variables such as layer normalization constants in custom neural network layers
+

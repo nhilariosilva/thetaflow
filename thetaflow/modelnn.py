@@ -684,9 +684,10 @@ class ModelNN(keras.models.Model):
                         best_metric_epoch = epoch
                         best_metric = current_loss
                         # best_weights = [tf.identity(w) for w in self.trainable_variables]
+                        # self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
     
                         # Do NOT create a new list. Update the existing variables in-place.
-                        for i, w in enumerate(self.trainable_variables):
+                        for i, w in enumerate(self.variables):
                             self.best_weights[i].assign(w)
     
                         lr_wait = tf.constant(0, dtype = tf.int32)
@@ -701,8 +702,8 @@ class ModelNN(keras.models.Model):
                         tf.print("\nConvergence criterion reached. Stopping.")
                         tf.print("Restoring best weights...")
                     # Restoring best weights
-                    for i, w in enumerate(self.trainable_variables):
-                        self.trainable_variables[i].assign(self.best_weights[i])
+                    for i, w in enumerate(self.variables):
+                        self.variables[i].assign(self.best_weights[i])
                         # tf.print(self.best_weights[i])
 
                     convergence_reason = "stopped_improving"
@@ -731,8 +732,8 @@ class ModelNN(keras.models.Model):
                                     tf.print("\nConvergence criterion reached. Stopping.")
                                     tf.print("Restoring best weights...")
                                 # Restoring best weights
-                                for i, w in enumerate(self.trainable_variables):
-                                    self.trainable_variables[i].assign(self.best_weights[i])
+                                for i, w in enumerate(self.variables):
+                                    self.variables[i].assign(self.best_weights[i])
                                     # tf.print(self.best_weights[i])
 
                                 convergence_reason = "minimal_learning_rate"
@@ -877,7 +878,8 @@ class ModelNN(keras.models.Model):
             print("Initializing training...")
         start_time = time.time()
 
-        self.best_weights = [tf.Variable(w, trainable = False) for w in self.trainable_variables]
+        # self.best_weights = [tf.Variable(w, trainable = False) for w in self.trainable_variables]
+        self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
         
         self.training = True
         # Compiled training routine
@@ -972,7 +974,8 @@ class ModelNN(keras.models.Model):
             # Redefine the gradients accumulation objects to match the current trainable_variables structure
             self.define_gradients()
             # Redefine the best weights object so they match the current trainable_variables structure
-            self.best_weights = [tf.Variable(w, trainable = False) for w in self.trainable_variables]
+            # self.best_weights = [tf.Variable(w, trainable = False) for w in self.trainable_variables]
+            self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
 
             # During the fine-tuning phase, it is desired to obtain a local maxima for the log-likelihood.
             # Therefore, we necessarily fix the training data loss to be the observed metric for early stopping and learning rate reduction
@@ -1140,6 +1143,9 @@ class ModelNN(keras.models.Model):
             # if self.neural_network_use and not getattr(self.optimizer_nn, 'built', False):
             if(self.neural_network_use):
                 self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
+
+            # Initialize best weights object
+            self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
             
             epochs = tf.constant(epochs, dtype = tf.int32)
 
