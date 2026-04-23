@@ -22,3 +22,6 @@ Dev Log: April 17, 2026
 - Added self.best_weights initialization in pre_train_model function (BUG)
 - Switched best weights from tracking self.trainable_variables to track self.variables. That way it can track variables such as layer normalization constants in custom neural network layers
 
+Dev Log: April 22, 2026
+
+- Fixed the older version of variable_function_covariance to match current covariance calculations, such as acknowledging that self.covariance_output returns a tuple now

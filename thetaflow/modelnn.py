@@ -1755,8 +1755,8 @@ class ModelNN(keras.models.Model):
             nn_output = self(x)
         
         # Obtain the covariance matrices for all inputs, x
-        theta_cov = self.covariance_output(x)
-
+        raw_cov, theta_cov = self.covariance_output(x)
+        
         # Initialize gradient tracker for parameters
         self._delta_tape = tf.GradientTape(persistent=True)
         self._tracked_theta_tensors = {}
@@ -1769,8 +1769,6 @@ class ModelNN(keras.models.Model):
             # Ensures the output from fun is atleast two dimensional
             if(len(f_theta.shape) == 1):
                 f_theta = tf.expand_dims(f_theta, axis = -1)
-
-        # print("f_theta shape", f_theta.shape)
         
         ordered_theta_var_names = []
         ordered_theta_tensors = []
@@ -1794,7 +1792,7 @@ class ModelNN(keras.models.Model):
                 else:
                     # ordered_theta_tensors.append( None )
                     theta_used[ var_name ] = False
-
+                    
         J_list = []
         
         used_counter = 0
@@ -1805,6 +1803,7 @@ class ModelNN(keras.models.Model):
                 # If parameter is independent get the full jacobian, since it is the same for every observation
                 if( parameter in self.independent_pars ):
                     parameter_jacobian = self._delta_tape.jacobian(f_theta, ordered_theta_tensors[ used_counter ], experimental_use_pfor = False)
+                    # print("JACOBIAN", parameter, ":", parameter_jacobian)
                     # If first dimension of jacobian does not match data dimension and we know for sure there are input observations, x
                     if( (parameter_jacobian is not None) and (x is not None and self.neural_network_use) and (parameter_jacobian.shape[0] != x.shape[0]) ):
                         parameter_jacobian = tf.broadcast_to(parameter_jacobian, (x.shape[0], 1, 1))
