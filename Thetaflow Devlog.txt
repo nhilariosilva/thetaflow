@@ -25,3 +25,17 @@ Dev Log: April 17, 2026
 Dev Log: April 22, 2026
 
 - Fixed the older version of variable_function_covariance to match current covariance calculations, such as acknowledging that self.covariance_output returns a tuple now
+
+Dev Log: April 26, 2026
+
+- In order to fully implement huge datasets, reprogrammed every aspect of input data handling and training configurations. Now all data is handled in the background by tf.data.Dataset objects,
+ensuring that not necessarily all data should be loaded into memory.
+- The implementation involved the functions "get_covariances", "config_training", "pre_train_model", "train_model" and "_compiled_training_loop_optimized"
+- The package now accepts preprocessed tf.data.Dataset structures as well as full data, disposed in the form of arrays. By allowing Datasets, we consider cases where data must be loaded
+dynamically during training, because otherwise memory can't handle so much size.
+
+Dev Log: April 27, 2026
+
+- Fixed elapsed time and training speed calculations for all possible training execution scenarios (was unable to track time when using GPU with full determinism on)
+- Updated the prints during training to show the speed estimates and the total training time
+- Fixed get_covariances function to obtain the matrix optimally using the C++ flux (Large datasets were exploding memory usage when reaching this function after training)
