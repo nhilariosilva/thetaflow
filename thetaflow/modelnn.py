@@ -22,14 +22,9 @@ import logging
 
 import pickle
 
-global_determinism = False
-
 def set_global_determinism():
     # 1. Force TensorFlow to use deterministic C++ operations
     tf.config.experimental.enable_op_determinism()
-    global global_determinism
-
-    global_determinism = True
     
 def set_global_seed(seed = 42, verbose = False):
     # 2. Lock down all standard random number generators
@@ -77,12 +72,16 @@ class ModelNN(keras.models.Model):
         self.configured = False
         self.training = False
         self.current_epoch = tf.Variable(0, dtype = tf.int32, trainable = False, name = "current_epoch")
+
+        # Initialize raw data structures
+        # If user passes tf.data.Datasets in training, these will continue being None
+        # IF user passes raw Numpy arrays, these will track their sample sizes and handled data
+        self.n_train, self.n_val = None, None
+        self.x_train, self.data_train = None, None
+        self.x_val, self.data_val = None, None
         
         self.total_hessian = None
         self.weights_covariance = None
-        
-        self.previous_nn_predictions = None
-        self.previous_independent_predictions = None
         
         self.define_structure()
 
@@ -513,23 +512,23 @@ class ModelNN(keras.models.Model):
         self.optimizer_nn = optimizer_nn
 
     @tf.function(jit_compile = False, reduce_retracing = True)
-    def _compiled_training_loop_optimized(self, train_dataset, epochs,
-                                          shuffle = True,
-                                          validation = False, val_dataset = None, force_training_validation = False,
-                                          early_stopping = True,
-                                          early_stopping_patience = tf.constant(10, dtype = tf.int32),
-                                          early_stopping_warmup = tf.constant(0, dtype = tf.int32),
-                                          reduce_lr = True,
-                                          reduce_lr_warmup = tf.constant(0, dtype = tf.int32),
-                                          reduce_lr_factor = tf.constant(0.5, dtype = tf.float32),
-                                          reduce_lr_min_delta = tf.constant(0.0, dtype = tf.float32),
-                                          reduce_lr_patience = tf.constant(5, dtype = tf.int32),
-                                          reduce_lr_cooldown = tf.constant(20, dtype = tf.int32),
-                                          reduce_lr_min_lr = tf.constant(5e-4, dtype = tf.float32),
-                                          deterministic = True,
-                                          pre_training = False,
-                                          fine_tuning = False,
-                                          verbose = True, print_freq = tf.constant(100, dtype = tf.int32)):
+    def _compiled_training_loop_dataset(self, train_dataset, epochs,
+                                        shuffle = True,
+                                        validation = False, val_dataset = None, force_training_validation = False,
+                                        early_stopping = True,
+                                        early_stopping_patience = tf.constant(10, dtype = tf.int32),
+                                        early_stopping_warmup = tf.constant(0, dtype = tf.int32),
+                                        reduce_lr = True,
+                                        reduce_lr_warmup = tf.constant(0, dtype = tf.int32),
+                                        reduce_lr_factor = tf.constant(0.5, dtype = tf.float32),
+                                        reduce_lr_min_delta = tf.constant(0.0, dtype = tf.float32),
+                                        reduce_lr_patience = tf.constant(5, dtype = tf.int32),
+                                        reduce_lr_cooldown = tf.constant(20, dtype = tf.int32),
+                                        reduce_lr_min_lr = tf.constant(5e-4, dtype = tf.float32),
+                                        deterministic = True,
+                                        pre_training = False,
+                                        fine_tuning = False,
+                                        verbose = True, print_freq = tf.constant(100, dtype = tf.int32)):
         """
             Executes the entire optimization loop purely in C++.
             Bypasses all Keras callbacks, progress bars, and Python overhead.
@@ -547,7 +546,6 @@ class ModelNN(keras.models.Model):
         val_loss_history = tf.TensorArray(tf.float32, size = epochs, clear_after_read = False)
         nn_learning_rate_history = tf.TensorArray(tf.float32, size = epochs, clear_after_read = False)
         
-        global global_determinism
         start_time = tf.cast(tf.py_function(func=lambda: time.time(), inp=[], Tout=tf.float64), tf.float64)
 
         # ReduceLROnPlateau routine variables        
@@ -595,7 +593,6 @@ class ModelNN(keras.models.Model):
                 
                 # 1. Forward Pass & Loss Computation
                 with tf.GradientTape() as tape:
-
                     # If model finetuning, treat the neural network as a deterministic black box
                     # If there are dropout layers, the output will be random and break training
                     if(fine_tuning):
@@ -741,7 +738,6 @@ class ModelNN(keras.models.Model):
                 # Write to validation history
                 val_loss_history = val_loss_history.write(epoch, current_loss_val)
 
-
             # If validation = True and force_training_validation = True, we are asking the model to save the validation data loss,
             # but do not use it for early stopping. Essentially, this variable controls whether we want to observe the loss
             # behaviour on the validation set when we ignore it in training (useful for didactic purposes. Showing how the model overfits)
@@ -749,7 +745,6 @@ class ModelNN(keras.models.Model):
                 current_loss = current_loss_train
             else:
                 current_loss = current_loss_val
-            
             
             # if(reduce_lr or early_stopping):
 
@@ -872,6 +867,343 @@ class ModelNN(keras.models.Model):
         
         return final_epoch, convergence_reason, loss_history, val_loss_history, nn_learning_rate_history, best_metric_epoch, best_metric
 
+    @tf.function(jit_compile = False, reduce_retracing = True)
+    def _compiled_training_loop_rawdata(self, x_train, data_train,
+                                        epochs, batch_size,
+                                        shuffle = True,
+                                        validation = False, x_val = None, data_val = None, force_training_validation = False,
+                                        early_stopping = True,
+                                        early_stopping_patience = tf.constant(10, dtype = tf.int32),
+                                        early_stopping_warmup = tf.constant(0, dtype = tf.int32),
+                                        reduce_lr = True,
+                                        reduce_lr_warmup = tf.constant(0, dtype = tf.int32),
+                                        reduce_lr_factor = tf.constant(0.5, dtype = tf.float32),
+                                        reduce_lr_min_delta = tf.constant(0.0, dtype = tf.float32),
+                                        reduce_lr_patience = tf.constant(5, dtype = tf.int32),
+                                        reduce_lr_cooldown = tf.constant(20, dtype = tf.int32),
+                                        reduce_lr_min_lr = tf.constant(5e-4, dtype = tf.float32),
+                                        deterministic = True,
+                                        pre_training = False,
+                                        fine_tuning = False,
+                                        verbose = True, print_freq = tf.constant(100, dtype = tf.int32)):
+        """
+            Executes the entire optimization loop purely in C++.
+            Bypasses all Keras callbacks, progress bars, and Python overhead.
+        """
+        # Training variables
+        final_epoch = tf.constant(0, dtype = tf.int32)
+        current_loss = tf.constant(0.0, dtype = tf.float32)
+        stop_training = False
+        
+        lr_independent = self.optimizer_independent.learning_rate
+        lr_nn = self.optimizer_nn.learning_rate
+
+        # Set up history variables to track convergence profile
+        loss_history = tf.TensorArray(tf.float32, size = epochs, clear_after_read = False)
+        val_loss_history = tf.TensorArray(tf.float32, size = epochs, clear_after_read = False)
+        
+        nn_learning_rate_history = tf.TensorArray(tf.float32, size = epochs, clear_after_read = False)
+        
+        start_time = tf.cast(tf.py_function(func=lambda: time.time(), inp=[], Tout=tf.float64), tf.float64)
+
+        n_samples = tf.shape(data_train[0])[0]
+
+        # ReduceLROnPlateau routine variables
+        
+        # Reduce learning rate wait
+        lr_wait = tf.constant(0, dtype = tf.int32)
+        # Early stopping wait
+        es_wait = tf.constant(0, dtype = tf.int32)
+
+        current_loss_train = np.nan
+        current_loss_val = 0.0
+        
+        lr_cooldown_counter = tf.constant(0, dtype = tf.int32)
+        best_metric = tf.constant(float('inf'), dtype = tf.float32)
+        best_metric_epoch = tf.constant(0, dtype = tf.int32)
+        new_lr_ind = tf.constant(0.0, dtype = tf.float32)
+        new_lr_nn = tf.constant(0.0, dtype = tf.float32)
+
+        # Save the initial weights as the best
+        # best_weights = [tf.identity(w) for w in self.trainable_variables]
+        # self.best_weights = [tf.Variable(w, trainable=False) for w in self.trainable_variables]
+
+        # By default, if convergence_reason does not change during training, that's because the algorithm reached the final
+        # epoch without ever converging
+        convergence_reason = "all_epochs"
+        
+        for epoch in tf.range(epochs):
+            # At the start of each epoch, assign the current epoch to a global variable
+            self.current_epoch.assign( tf.cast(epoch, tf.int32) )
+            
+            # Shuffle data at the start of each epoch, if desired
+            if(shuffle):
+                indices = tf.random.shuffle( tf.range(n_samples) )
+                # If we are dealing with a purely statistical model (no regression in any parameter) x_train may be None
+                x_epoch = None
+                if(x_train is not None):
+                    x_epoch = tf.gather(x_train, indices)
+                data_epoch = tuple([tf.gather(d, indices) for d in data_train])
+            else:
+                x_epoch = x_train
+                data_epoch = data_train
+
+            batch_num = 0
+            # Cycle through all batches
+            for start_idx in tf.range(0, n_samples, batch_size):
+                batch_num += 1
+                
+                # Ensure the last batch doesn't go out of bounds
+                end_idx = tf.minimum(start_idx + batch_size, n_samples)
+
+                # Slice the batch out of RAM instantly
+                x_batch = None
+                if(x_train is not None):
+                    x_batch = x_epoch[start_idx : end_idx]
+                batch_data_tuple = tuple( [d[start_idx : end_idx] for d in data_epoch] )
+
+                # Reconstruct full_data for the loss function
+                batch_full_data = (x_batch,) + batch_data_tuple
+                
+                # 1. Forward Pass & Loss Computation
+                with tf.GradientTape() as tape:
+
+                    # If model finetuning, treat the neural network as a deterministic black box
+                    # If there are dropout layers, the output will be random and break training
+                    if(fine_tuning):
+                        nn_output_batch = self(x_batch, training = False)
+                    else:
+                        nn_output_batch = self(x_batch, training = True)
+                    
+                    if(pre_training):
+                        loss_value = self.loglikelihood_loss_pretrain(nn_output = nn_output_batch, data = batch_full_data)
+                    else:
+                        loss_value = self.loglikelihood_loss(self, nn_output = nn_output_batch, data = batch_full_data)
+
+                    # loss_history = loss_history.write(epoch, loss_value)
+                                      
+                    # Automatic regularization from layer definitions. Check if any layer in the model generated a regularization loss
+                    if(self.losses):
+                        # sums all tensors in the self.losses list
+                        regularization_penalty = tf.math.add_n( self.losses )
+
+                        batch_fraction = tf.cast(tf.shape(x_batch)[0], tf.float32) / tf.cast(n_samples, tf.float32)
+                        # Add it to the base log-likelihood
+                        loss_value = loss_value + regularization_penalty * batch_fraction
+                
+                gradients = tape.gradient(loss_value, self.trainable_variables)
+    
+                # Gradient trap: Check if any gradient in the entire network became NaN or Inf
+                has_nan_grad = tf.reduce_any([tf.reduce_any(tf.math.is_nan(g)) for g in gradients if g is not None])
+                has_inf_grad = tf.reduce_any([tf.reduce_any(tf.math.is_inf(g)) for g in gradients if g is not None])
+                if tf.math.logical_or(has_nan_grad, has_inf_grad):
+                    tf.print("\n[!] FATAL: Gradients exploded to NaN/Inf at Epoch:", epoch)
+                    convergence_reason = "nan_gradients"
+                    stop_training = True
+                    break
+                
+                # To avoid crash problems in that case, we simply replace None with a zero like gradient, so those weights do not get updated
+                # It is the user's responsibility to build a loss that depends on all the trainable parameters, but we allow that to happen in this case
+                # for generality and to avoid unneccessary crashes when testing new models
+                gradients = [g if g is not None else tf.zeros_like(v) for g, v in zip(gradients, self.trainable_variables)]
+
+                # The first weights are always destined to the independent parameters
+                # The neural network related weights come after those in the self.trainable_variables object
+                independent_gradients = gradients[ :len(self.independent_pars) ]
+                nn_gradients = gradients[ len(self.independent_pars): ]
+
+                # ------------------------------------------------------------ Cumulate gradients ------------------------------------------------------------
+                self.n_acum_step.assign_add(1)
+                
+                if(self.independent_pars_use):
+                    for i in range( len(self.gradient_accumulation_independent_pars) ):
+                        self.gradient_accumulation_independent_pars[i].assign_add( independent_gradients[i] )
+                if(self.neural_network_use):
+                    for i in range( len(self.gradient_accumulation_nn) ):
+                        self.gradient_accumulation_nn[i].assign_add( nn_gradients[i] )
+                        
+                if( tf.equal(self.n_acum_step, self.gradient_accumulation_steps) ):
+                    if(self.independent_pars_use):
+                        ind_grads = gradients[:len(self.independent_pars)]
+                        self.optimizer_independent.apply_gradients( zip(ind_grads, self.trainable_variables[:len(self.independent_pars)]) )
+                        # Resets all the cumulated gradients to zero
+                        for i in range(len(self.gradient_accumulation_independent_pars)):
+                            self.gradient_accumulation_independent_pars[i].assign( tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32) )
+                        
+                    if(self.neural_network_use):
+                        nn_grads = gradients[len(self.independent_pars):]
+                        self.optimizer_nn.apply_gradients(zip(nn_grads, self.trainable_variables[len(self.independent_pars):]))
+                        # Resets all the cumulated gradients to zero
+                        for i in range(len(self.gradient_accumulation_nn)):
+                            self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
+                    # Resets the cumulation counter
+                    self.n_acum_step.assign(0)
+
+            
+            nn_learning_rate_history = nn_learning_rate_history.write(epoch, self.optimizer_nn.learning_rate)
+            # --------------------------------------------------------------- Evaluate stop criteria ---------------------------------------------------------------
+            # For comparisons we will be using the raw value in order to avoid potential link functions exponential explosions
+            # if(epoch >= 0):
+            # ------------------------------------ ReduceLROnPlateau custom mechanism. Hard-coded implementation needed for performance issues ------------------------------------
+            if(reduce_lr or early_stopping):
+                # Always compute the true, intact training loss
+                batch_train_full = (x_train,) + tuple(data_train)
+                nn_train_full = self(x_train, training = False)
+                
+                if(pre_training):
+                    current_loss_train = self.loglikelihood_loss_pretrain(nn_output = nn_train_full, data = batch_train_full)
+                else:
+                    current_loss_train = self.loglikelihood_loss(self, nn_output = nn_train_full, data = batch_train_full)
+                
+                # Write the true, full-dataset training loss to history!
+                loss_history = loss_history.write(epoch, current_loss_train)
+
+                # Compute the validation loss ONLY if requested
+                if(validation):
+                    batch_val_data = (x_val,) + tuple(data_val)
+                    nn_val_batch = self(x_val, training = False)
+                    
+                    if(pre_training):
+                        current_loss_val = self.loglikelihood_loss_pretrain(nn_output = nn_val_batch, data = batch_val_data)
+                    else:
+                        current_loss_val = self.loglikelihood_loss(self, nn_output = nn_val_batch, data = batch_val_data)
+                    
+                    # Write to validation history
+                    val_loss_history = val_loss_history.write(epoch, current_loss_val)
+
+                # If validation = True and force_training_validation = True, we are asking the model to save the validation data loss,
+                # but do not use it for early stopping. Essentially, this variable controls whether we want to observe the loss
+                # behaviour on the validation set when we ignore it in training (useful for didactic purposes. Showing how the model overfits)
+                if(force_training_validation or not validation):
+                    current_loss = current_loss_train
+                else:
+                    current_loss = current_loss_val
+
+                # Only start tracking the best metric after the warmup period
+                # that avoids the model from getting low loss values from an initial stage of training
+                # where the model may had been in a degenerate, unstable state, yet with a pathological low loss value (burnin phase)
+                if(epoch >= early_stopping_warmup):
+                    # Check if the loss improved by at least the min_delta
+                    if(current_loss < (best_metric - reduce_lr_min_delta)):
+                        best_metric_epoch = epoch
+                        best_metric = current_loss
+                        # best_weights = [tf.identity(w) for w in self.trainable_variables]
+                        # self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
+    
+                        # Do NOT create a new list. Update the existing variables in-place.
+                        for i, w in enumerate(self.variables):
+                            self.best_weights[i].assign(w)
+    
+                        lr_wait = tf.constant(0, dtype = tf.int32)
+                        es_wait = tf.constant(0, dtype = tf.int32)
+                    else:
+                        lr_wait = lr_wait + 1
+                        es_wait = es_wait + 1
+                
+                # If it has passed early_stopping_patience epochs with no improvement in the loss function, halts training
+                if(early_stopping and es_wait >= early_stopping_patience and epoch > early_stopping_warmup):
+                    if(verbose):
+                        tf.print("\nConvergence criterion reached. Stopping.")
+                        tf.print("Restoring best weights...")
+                    # Restoring best weights
+                    for i, w in enumerate(self.variables):
+                        self.variables[i].assign(self.best_weights[i])
+                        # tf.print(self.best_weights[i])
+
+                    convergence_reason = "stopped_improving"
+                    stop_training = True
+                
+                if(not stop_training):
+                    if(lr_cooldown_counter > 0):
+                        lr_cooldown_counter = lr_cooldown_counter - 1
+                        lr_wait = tf.constant(0, dtype = tf.int32)
+                    else:                                
+                        if(reduce_lr and lr_wait >= reduce_lr_patience and epoch > reduce_lr_warmup):
+                            # Decay the learning rates
+                            if(self.independent_pars_use):
+                                old_lr_ind = self.optimizer_independent.learning_rate
+                                new_lr_ind = tf.maximum(old_lr_ind * reduce_lr_factor, reduce_lr_min_lr)
+                                self.optimizer_independent.learning_rate.assign( new_lr_ind )
+                                
+                            if(self.neural_network_use):
+                                old_lr_nn = self.optimizer_nn.learning_rate
+                                new_lr_nn = tf.maximum(old_lr_nn * reduce_lr_factor, reduce_lr_min_lr)
+                                self.optimizer_nn.learning_rate.assign( new_lr_nn )
+
+                            # If minimum learning rate is reached, stop training
+                            if( early_stopping and (tf.equal(new_lr_ind, reduce_lr_min_lr) or tf.equal(new_lr_nn, reduce_lr_min_lr)) and (epoch > early_stopping_warmup) ):
+                                if(verbose):
+                                    tf.print("\nConvergence criterion reached. Stopping.")
+                                    tf.print("Restoring best weights...")
+                                # Restoring best weights
+                                for i, w in enumerate(self.variables):
+                                    self.variables[i].assign(self.best_weights[i])
+                                    # tf.print(self.best_weights[i])
+
+                                convergence_reason = "minimal_learning_rate"
+                                stop_training = True
+                            
+                            # Right after reducing learning rate, set a cooldown for it to settle (For the next reduce_lr_cooldown epochs, it won't be reduced)
+                            lr_cooldown_counter = reduce_lr_cooldown
+                            # Redefine the learning rate counter to zero
+                            lr_wait = tf.constant(0, dtype = tf.int32)    
+                    
+            # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            
+            # --------------------------------------------- Native progress tracker without great performance lose ---------------------------------------------
+            if(verbose and epoch % print_freq == 0):
+                if(epoch > 0):
+                    current_time = tf.cast(tf.py_function(func=lambda: time.time(), inp=[], Tout=tf.float64), tf.float64)
+                    elapsed_time = current_time - start_time
+                    epochs_per_sec = tf.cast(epoch, tf.float64) / elapsed_time
+                    
+                    # If epochs_per_sec < 1, that means eack epoch takes longer than a second. We take its reciprocal to obtain sec_per_epoch
+                    if(epochs_per_sec < 1):
+                        tf.print(
+                            "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                            "| Loss: ", current_loss, 
+                            "| Best Loss: ", best_metric,
+                            "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                            "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                            end = ""
+                        )
+                    else:
+                        tf.print(
+                            "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                            "| Loss: ", current_loss, 
+                            "| Best Loss: ", best_metric,
+                            "| Speed: ", tf.cast(epochs_per_sec, tf.int32), " epoch/s   ",
+                            "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                            end = ""
+                        )
+            # --------------------------------------------------------------------------------------------------------------------------------------------------
+                
+            # Stop if converged or an error occurred
+            if stop_training:
+                break
+
+        # For a tf.TensorArray we must stack its values before finally returning it as a Tensor
+        # final_distances_tensor = distances_history.stack()
+
+        # After training, restores the learning rates for both optimizers
+        self.optimizer_independent.learning_rate.assign(lr_independent)
+        self.optimizer_nn.learning_rate.assign(lr_nn)
+
+        final_epoch = epoch
+
+        if(validation):
+            val_loss_history = val_loss_history.write(0, val_loss_history.read(1))
+            val_loss_history = val_loss_history.stack()
+        else:
+            val_loss_history = None
+        
+        loss_history = loss_history.stack()
+
+        nn_learning_rate_history = nn_learning_rate_history.stack()
+        
+        return final_epoch, convergence_reason, loss_history, val_loss_history, nn_learning_rate_history, best_metric_epoch, best_metric
+
+    
     def train_model(self, epochs, x, data = None,
                     shuffle = True,
                     validation = False, n_train = None, n_val = None, x_val = None, data_val = None, val_prop = None, force_training_validation = False,
@@ -902,7 +1234,7 @@ class ModelNN(keras.models.Model):
                              optimizer_nn = optimizer_nn,
                              train_batch_size = train_batch_size, val_batch_size = val_batch_size,
                              buffer_size = buffer_size, gradient_accumulation_steps = gradient_accumulation_steps,
-                             verbose = verbose)        
+                             verbose = verbose)
         
         # Force the optimizers to build their state variables in Python so they don't try to create them inside the C++ when function is called a second time
         if(self.independent_pars_use):
@@ -948,28 +1280,56 @@ class ModelNN(keras.models.Model):
         self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
         
         self.training = True
-        # Compiled training routine
-        last_epoch, convergence_reason, loss_history, val_loss_history, \
-        nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_optimized(
-            self.train_dataset, epochs,
-            shuffle = shuffle,
-            validation = validation, val_dataset = self.val_dataset, force_training_validation = force_training_validation,
-            early_stopping = early_stopping,
-            early_stopping_patience = early_stopping_patience,
-            early_stopping_warmup = early_stopping_warmup,
-            reduce_lr = reduce_lr,
-            reduce_lr_warmup = reduce_lr_warmup,
-            reduce_lr_factor = reduce_lr_factor,
-            reduce_lr_min_delta = reduce_lr_min_delta,
-            reduce_lr_patience = reduce_lr_patience,
-            reduce_lr_cooldown = reduce_lr_cooldown,
-            reduce_lr_min_lr = reduce_lr_min_lr,
-            deterministic = deterministic,
-            pre_training = False,
-            fine_tuning = False,
-            verbose = verbose,
-            print_freq = print_freq
-        )
+
+        # If self.data is not None, that means the user passed raw data to the model
+        # tf.data.Datasets are not needed for training. That allows a faster training routine
+        if(self.data is not None):
+            # Compiled training routine
+            last_epoch, convergence_reason, loss_history, val_loss_history, \
+            nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_rawdata(
+                self.x_train, self.data_train, epochs,
+                tf.constant(self.train_batch_size, dtype = tf.int32),
+                shuffle = shuffle,
+                validation = validation, x_val = self.x_val, data_val = self.data_val, force_training_validation = force_training_validation,
+                early_stopping = early_stopping,
+                early_stopping_patience = early_stopping_patience,
+                early_stopping_warmup = early_stopping_warmup,
+                reduce_lr = reduce_lr,
+                reduce_lr_warmup = reduce_lr_warmup,
+                reduce_lr_factor = reduce_lr_factor,
+                reduce_lr_min_delta = reduce_lr_min_delta,
+                reduce_lr_patience = reduce_lr_patience,
+                reduce_lr_cooldown = reduce_lr_cooldown,
+                reduce_lr_min_lr = reduce_lr_min_lr,
+                deterministic = deterministic,
+                pre_training = False,
+                fine_tuning = False,
+                verbose = verbose,
+                print_freq = print_freq
+            )
+        else:
+            # Compiled training routine
+            last_epoch, convergence_reason, loss_history, val_loss_history, \
+            nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_dataset(
+                self.train_dataset, epochs,
+                shuffle = shuffle,
+                validation = validation, val_dataset = self.val_dataset, force_training_validation = force_training_validation,
+                early_stopping = early_stopping,
+                early_stopping_patience = early_stopping_patience,
+                early_stopping_warmup = early_stopping_warmup,
+                reduce_lr = reduce_lr,
+                reduce_lr_warmup = reduce_lr_warmup,
+                reduce_lr_factor = reduce_lr_factor,
+                reduce_lr_min_delta = reduce_lr_min_delta,
+                reduce_lr_patience = reduce_lr_patience,
+                reduce_lr_cooldown = reduce_lr_cooldown,
+                reduce_lr_min_lr = reduce_lr_min_lr,
+                deterministic = deterministic,
+                pre_training = False,
+                fine_tuning = False,
+                verbose = verbose,
+                print_freq = print_freq
+            )
         self.training = False
 
         self.last_epoch = last_epoch
@@ -1015,18 +1375,30 @@ class ModelNN(keras.models.Model):
             # To avoid user caused problems, we enforce a single batch the size of the data with train_batch_size = None and
             # gradient_accumulation_steps = None
             # We are essentially assuring the Full-Batch Gradient Descent mechanics, avoiding noisy mini-batch updates
-            # Also, since the first call to config_training already defined the validation data (if x_val and data_val are originally None)
-            # Here, we explicitly pass self.x_train, self.x_val, self.data_train and self.data_val
-            # Otherwise, this function may completely shuffle the data and result in completely different loss values and data leakage!
-            self.config_training(self.train_dataset, data = None,
-                                 shuffle = shuffle,
-                                 validation = validation, n_train = self.n_train, n_val = self.n_val,
-                                 x_val = self.val_dataset, data_val = None, val_prop = None,
-                                 optimizer_independent = self.optimizer_independent,
-                                 optimizer_nn = self.optimizer_nn,
-                                 train_batch_size = self.train_batch_size, val_batch_size = self.val_batch_size,
-                                 buffer_size = buffer_size, gradient_accumulation_steps = None,
-                                 verbose = verbose)           
+            
+            # If user passed raw data, training configuration follows differently
+            if(self.data is not None):
+                # Also, since the first call to config_training already defined the validation data (if x_val and data_val are originally None)
+                # Here, we explicitly pass self.x_train, self.x_val, self.data_train and self.data_val
+                # Otherwise, this function may completely shuffle the data and result in completely different loss values and data leakage!
+                self.config_training(self.x_train, self.data_train,
+                                     shuffle = shuffle,
+                                     validation = validation, val_prop = val_prop, x_val = self.x_val, data_val = self.data_val,
+                                     optimizer_independent = self.optimizer_independent,
+                                     optimizer_nn = self.optimizer_nn,
+                                     train_batch_size = None, val_batch_size = None,
+                                     buffer_size = buffer_size, gradient_accumulation_steps = None,
+                                     verbose = verbose)
+            else:
+                self.config_training(self.train_dataset, data = None,
+                                     shuffle = shuffle,
+                                     validation = validation, n_train = self.n_train, n_val = self.n_val,
+                                     x_val = self.val_dataset, data_val = None, val_prop = None,
+                                     optimizer_independent = self.optimizer_independent,
+                                     optimizer_nn = self.optimizer_nn,
+                                     train_batch_size = self.train_batch_size, val_batch_size = self.val_batch_size,
+                                     buffer_size = buffer_size, gradient_accumulation_steps = None,
+                                     verbose = verbose)
             # Set all but the last layers as non-trainable
             for i in range( len(self.layers)-1 ):
                 self.layers[i].trainable = False
@@ -1051,27 +1423,54 @@ class ModelNN(keras.models.Model):
             finetune_reduce_lr_cooldown = tf.constant(finetune_reduce_lr_cooldown, dtype = tf.int32)
             finetune_reduce_lr_min_lr = tf.constant(finetune_reduce_lr_min_lr, dtype = tf.float32)
 
-            last_epoch, convergence_reason, loss_history, val_loss_history, \
-            nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_optimized(
-                self.train_dataset, epochs,
-                shuffle = shuffle,
-                validation = validation, val_dataset = self.val_dataset, force_training_validation = True,
-                early_stopping = finetune_early_stopping,
-                early_stopping_patience = finetune_early_stopping_patience,
-                early_stopping_warmup = finetune_early_stopping_warmup,
-                reduce_lr = finetune_reduce_lr,
-                reduce_lr_warmup = finetune_reduce_lr_warmup,
-                reduce_lr_factor = finetune_reduce_lr_factor,
-                reduce_lr_min_delta = finetune_reduce_lr_min_delta,
-                reduce_lr_patience = finetune_reduce_lr_patience,
-                reduce_lr_cooldown = finetune_reduce_lr_cooldown,
-                reduce_lr_min_lr = finetune_reduce_lr_min_lr,
-                deterministic = deterministic,
-                pre_training = False,
-                fine_tuning = True,
-                verbose = verbose,
-                print_freq = print_freq
-            )
+            # If self.data is not None, that means the user passed raw data to the model
+            # tf.data.Datasets are not needed for training. That allows a faster training routine
+            if(self.data is not None):
+                # Compiled training routine
+                last_epoch, convergence_reason, loss_history, val_loss_history, \
+                nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_rawdata(
+                    self.x_train, self.data_train, epochs,
+                    tf.constant(self.train_batch_size, dtype = tf.int32),
+                    shuffle = shuffle,
+                    validation = validation, x_val = self.x_val, data_val = self.data_val, force_training_validation = True,
+                    early_stopping = early_stopping,
+                    early_stopping_patience = early_stopping_patience,
+                    early_stopping_warmup = early_stopping_warmup,
+                    reduce_lr = reduce_lr,
+                    reduce_lr_warmup = reduce_lr_warmup,
+                    reduce_lr_factor = reduce_lr_factor,
+                    reduce_lr_min_delta = reduce_lr_min_delta,
+                    reduce_lr_patience = reduce_lr_patience,
+                    reduce_lr_cooldown = reduce_lr_cooldown,
+                    reduce_lr_min_lr = reduce_lr_min_lr,
+                    deterministic = deterministic,
+                    pre_training = False,
+                    fine_tuning = True,
+                    verbose = verbose,
+                    print_freq = print_freq
+                )
+            else:
+                last_epoch, convergence_reason, loss_history, val_loss_history, \
+                nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_optimized(
+                    self.train_dataset, epochs,
+                    shuffle = shuffle,
+                    validation = validation, val_dataset = self.val_dataset, force_training_validation = True,
+                    early_stopping = finetune_early_stopping,
+                    early_stopping_patience = finetune_early_stopping_patience,
+                    early_stopping_warmup = finetune_early_stopping_warmup,
+                    reduce_lr = finetune_reduce_lr,
+                    reduce_lr_warmup = finetune_reduce_lr_warmup,
+                    reduce_lr_factor = finetune_reduce_lr_factor,
+                    reduce_lr_min_delta = finetune_reduce_lr_min_delta,
+                    reduce_lr_patience = finetune_reduce_lr_patience,
+                    reduce_lr_cooldown = finetune_reduce_lr_cooldown,
+                    reduce_lr_min_lr = finetune_reduce_lr_min_lr,
+                    deterministic = deterministic,
+                    pre_training = False,
+                    fine_tuning = True,
+                    verbose = verbose,
+                    print_freq = print_freq
+                )
 
             self.last_epoch_finetune = last_epoch
             self.loss_history_finetune = loss_history
@@ -1217,28 +1616,55 @@ class ModelNN(keras.models.Model):
             reduce_lr_min_lr = tf.constant(reduce_lr_min_lr, dtype = tf.float32)
     
             print_freq = tf.constant(print_freq, dtype = tf.int32)
-            
-            last_epoch, convergence_reason, loss_history, val_loss_history, \
-            nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_optimized(
-                self.train_dataset, epochs,
-                shuffle = shuffle,
-                validation = validation, val_dataset = self.val_dataset, force_training_validation = force_training_validation,
-                early_stopping = early_stopping,
-                early_stopping_patience = early_stopping_patience,
-                early_stopping_warmup = early_stopping_warmup,
-                reduce_lr = reduce_lr,
-                reduce_lr_warmup = reduce_lr_warmup,
-                reduce_lr_factor = reduce_lr_factor,
-                reduce_lr_min_delta = reduce_lr_min_delta,
-                reduce_lr_patience = reduce_lr_patience,
-                reduce_lr_cooldown = reduce_lr_cooldown,
-                reduce_lr_min_lr = reduce_lr_min_lr,
-                deterministic = deterministic,
-                pre_training = True,
-                fine_tuning = False,
-                verbose = verbose,
-                print_freq = print_freq
-            )
+
+            # If self.data is not None, that means the user passed raw data to the model
+            # tf.data.Datasets are not needed for training. That allows a faster training routine
+            if(self.data is not None):
+                # Compiled training routine
+                last_epoch, convergence_reason, loss_history, val_loss_history, \
+                nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_rawdata(
+                    self.x_train, self.data_train, epochs,
+                    tf.constant(self.train_batch_size, dtype = tf.int32),
+                    shuffle = shuffle,
+                    validation = validation, x_val = self.x_val, data_val = self.data_val, force_training_validation = force_training_validation,
+                    early_stopping = early_stopping,
+                    early_stopping_patience = early_stopping_patience,
+                    early_stopping_warmup = early_stopping_warmup,
+                    reduce_lr = reduce_lr,
+                    reduce_lr_warmup = reduce_lr_warmup,
+                    reduce_lr_factor = reduce_lr_factor,
+                    reduce_lr_min_delta = reduce_lr_min_delta,
+                    reduce_lr_patience = reduce_lr_patience,
+                    reduce_lr_cooldown = reduce_lr_cooldown,
+                    reduce_lr_min_lr = reduce_lr_min_lr,
+                    deterministic = deterministic,
+                    pre_training = True,
+                    fine_tuning = False,
+                    verbose = verbose,
+                    print_freq = print_freq
+                )
+            else:
+                last_epoch, convergence_reason, loss_history, val_loss_history, \
+                nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_dataset(
+                    self.train_dataset, epochs,
+                    shuffle = shuffle,
+                    validation = validation, val_dataset = self.val_dataset, force_training_validation = force_training_validation,
+                    early_stopping = early_stopping,
+                    early_stopping_patience = early_stopping_patience,
+                    early_stopping_warmup = early_stopping_warmup,
+                    reduce_lr = reduce_lr,
+                    reduce_lr_warmup = reduce_lr_warmup,
+                    reduce_lr_factor = reduce_lr_factor,
+                    reduce_lr_min_delta = reduce_lr_min_delta,
+                    reduce_lr_patience = reduce_lr_patience,
+                    reduce_lr_cooldown = reduce_lr_cooldown,
+                    reduce_lr_min_lr = reduce_lr_min_lr,
+                    deterministic = deterministic,
+                    pre_training = True,
+                    fine_tuning = False,
+                    verbose = verbose,
+                    print_freq = print_freq
+                )
 
             self.last_epoch_pretrain = last_epoch
             self.loss_history_pretrain = loss_history
@@ -1691,6 +2117,7 @@ class ModelNN(keras.models.Model):
         if(shuffle):
             train_dataset = train_dataset.cache().shuffle(buffer_size = self.buffer_size)
         self.train_dataset = train_dataset.batch(self.train_batch_size).prefetch(tf.data.AUTOTUNE)
+        self.train_dataset = [ tf.data.Dataset.get_single_element(self.train_dataset) ]
 
         val_dataset = None
         if(validation):
