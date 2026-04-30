@@ -43,3 +43,9 @@ Dev Log: April 27, 2026
 Dev Log: April 28, 2026
 
 - The complete update with tf.data.Datasets added an extreme overhead when data is simple and fully loaded into RAM. To fix it, I split the training process into _compiled_training_loop_rawdata and _compiled_training_loop_dataset. Both functions handle training data differently, depending if user input was a tf.data.Dataset object or Numpy arrays
+- Added option of having different number of epochs during fine-tuning than during training
+
+Dev Log: April 29, 2026
+
+- Added the tf.Dataset memory friendly processing approach for functions variable_function_covariance, summary, predict, covariance_output, evaluate_loss. Now, these functions support both raw data structures and tf.Datasets, handling memory accordingly
+- Fixed bug where finetune training hyperparameters were not being considered for the _compiled_training_loop_rawdata call in train_model

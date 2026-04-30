@@ -77,6 +77,7 @@ class ModelNN(keras.models.Model):
         # If user passes tf.data.Datasets in training, these will continue being None
         # IF user passes raw Numpy arrays, these will track their sample sizes and handled data
         self.n_train, self.n_val = None, None
+        self.x, self.data = None, None
         self.x_train, self.data_train = None, None
         self.x_val, self.data_val = None, None
         
@@ -339,11 +340,15 @@ class ModelNN(keras.models.Model):
         # If model has been trained, capture all the history metrics
         if hasattr(self, 'loss_history'):
             metrics_to_save = [
-                "last_epoch", "convergence_reason", "loss_history", "val_loss_history",
+                "last_epoch", "loss_history", "val_loss_history", "convergence_reason",
                 "nn_learning_rate_history", "best_metric_epoch", "best_metric",
-                "last_epoch_pretrain", "loss_history_pretrain", "val_loss_history_pretrain",
-                "last_epoch_finetune", "loss_history_finetune", "val_loss_history_finetune"
+                "last_epoch_finetune", "loss_history_finetune", "val_loss_history_finetune", "convergence_reason_finetune",
+                "nn_learning_rate_history_finetune", "best_metric_epoch_finetune", "best_metric_finetune",
+                "last_epoch_pretrain", "loss_history_pretrain", "val_loss_history_pretrain", "convergence_reason_pretrain",
+                "best_metric_epoch_pretrain", "best_metric_pretrain",
+                "nn_learning_rate_history_pretrain"
             ]
+            
             for metric in metrics_to_save:
                 if hasattr(self, metric):
                     metadata[metric] = getattr(self, metric)
@@ -416,23 +421,83 @@ class ModelNN(keras.models.Model):
         x = self.neural_network_call(self, x_input, training = training)
         return x
 
-    def predict(self, var_input, get_raw_value = False, training = False):
-        # If x_input is a string, the user want a
-        if isinstance(var_input, str):
-            return self.get_variable(var_input, get_raw_value = get_raw_value).numpy()
+    @tf.function(reduce_retracing=True)
+    def _compiled_predict_dataset(self, dataset):
+        """
+        Executes the forward pass over an entire dataset purely in C++.
+        Uses tf.TensorArray to dynamically accumulate batches without memory explosions.
+        """
+        # Initialize a dynamic array to hold the batch outputs
+        predictions_array = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
         
-        x_input = tf.cast(var_input, dtype = tf.float32)
-        # If input is a vector, transform it into a column
-        if(len(x_input.shape) == 1):
-            x_input = tf.reshape( x_input, shape = (len(x_input), 1) )
+        batch_index = tf.constant(0, dtype=tf.int32)
+        
+        for batch_data in dataset:
+            # Safely extract X depending on whether the dataset yields (X, y) or just X
+            # (e.g., your UTKFaces test_ds likely yields (filenames, ages))
+            if isinstance(batch_data, tuple):
+                x_batch = batch_data[0]
+            else:
+                x_batch = batch_data
+                
+            # Run the forward pass strictly in inference mode to keep BatchNorm/Dropout frozen
+            nn_output_batch = self(x_batch, training=False)
+            
+            # Write the batch output into the array
+            predictions_array = predictions_array.write(batch_index, nn_output_batch)
+            batch_index += 1
+            
+        # Concat merges all batches along the 0th axis into a single continuous tensor!
+        return predictions_array.concat()
+        
+    # def predict(self, var_input, get_raw_value = False, training = False):
+    #     # If x_input is a string, the user want a
+    #     if isinstance(var_input, str):
+    #         return self.get_variable(var_input, get_raw_value = get_raw_value).numpy()
+        
+    #     x_input = tf.cast(var_input, dtype = tf.float32)
+    #     # If input is a vector, transform it into a column
+    #     if(len(x_input.shape) == 1):
+    #         x_input = tf.reshape( x_input, shape = (len(x_input), 1) )
 
-        nn_output = self.neural_network_call(self, x_input, training = training)
+    #     nn_output = self.neural_network_call(self, x_input, training = training)
 
+    #     nn_output_parameters = {}
+    #     for par in self.nn_pars:
+    #         par_values = self.get_variable(par, nn_output, get_raw_value = get_raw_value)
+    #         nn_output_parameters[par] = par_values
+    #     return nn_output_parameters
+
+    def predict(self, var_input, get_raw_value=False, training=False):
+        # Handle Independent Parameters
+        if isinstance(var_input, str):
+            return self.get_variable(var_input, get_raw_value=get_raw_value).numpy()
+            
+        # Handle tf.data.Dataset (C++ Batches)
+        if isinstance(var_input, tf.data.Dataset):
+            # Fire the compiled loop to compute everything at maximum GPU speed
+            nn_output = self._compiled_predict_dataset(var_input)
+            
+        # Handle Raw Numpy Arrays / Tensors
+        else:
+            x_input = tf.cast(var_input, dtype=tf.float32)
+            # If input is a vector, transform it into a column
+            if len(x_input.shape) == 1:
+                x_input = tf.reshape(x_input, shape=(len(x_input), 1))
+                
+            # Compute a single massive forward pass
+            nn_output = self.neural_network_call(self, x_input, training=training)
+
+        # Map the outputs to the dictionary
         nn_output_parameters = {}
-        for par in self.nn_pars:
-            par_values = self.get_variable(par, nn_output, get_raw_value = get_raw_value)
-            nn_output_parameters[par] = par_values
+        if self.neural_network_use:
+            for par in self.nn_pars:
+                # Slices the massive concatenated tensor perfectly into your defined parameters
+                par_values = self.get_variable(par, nn_output, get_raw_value=get_raw_value)
+                nn_output_parameters[par] = par_values
+                
         return nn_output_parameters
+    
 
     def get_variable(self, parameter, nn_output = None, get_raw_value = False, force_true = False, current_epoch = 0):
         """
@@ -511,6 +576,53 @@ class ModelNN(keras.models.Model):
         self.optimizer_independent = optimizer_independent
         self.optimizer_nn = optimizer_nn
 
+    @tf.function(reduce_retracing=True)
+    def evaluate_dataset_loss(self, dataset):
+        """
+        Evaluates the total log-likelihood loss iteratively over a tf.data.Dataset.
+        Runs purely in C++ to prevent memory explosions on massive datasets.
+        """
+        total_loss = tf.constant(0.0, dtype=tf.float32)
+
+        # Loop through the dataset natively in the C++ graph
+        for batch_full_data in dataset:
+            
+            # 1. Unpack the batch
+            if self.neural_network_use:
+                x_batch = batch_full_data[0]
+                batch_data_tuple = batch_full_data[1:]
+            else:
+                x_batch = None
+                batch_data_tuple = batch_full_data
+
+            # 2. Dimension guard to prevent broadcasting errors
+            batch_data_tuple = tuple(
+                [tf.expand_dims(d, axis=-1) if len(d.shape) == 1 else d for d in batch_data_tuple]
+            )
+            batch_full_data_reconstructed = (x_batch,) + batch_data_tuple
+            
+            # 3. Forward pass strictly in inference mode (training=False)
+            if self.neural_network_use:
+                nn_output_batch = self(x_batch, training=False)
+            else:
+                nn_output_batch = None
+
+            # 4. Calculate loss for the current batch
+            batch_loss = self.loglikelihood_loss(self, nn_output=nn_output_batch, data=batch_full_data_reconstructed)
+            
+            # 5. Add regularization penalties if any exist
+            if self.losses:
+                regularization_penalty = tf.math.add_n(self.losses)
+                # Scale the penalty down by the dataset cardinality so it doesn't artificially inflate
+                # Note: We divide by dataset cardinality here if penalty is per-sample, 
+                # but standard Keras adds it directly. Adjust scaling if necessary for your formulation.
+                batch_loss += regularization_penalty 
+
+            # 6. Accumulate the loss
+            total_loss += batch_loss
+
+        return total_loss
+    
     @tf.function(jit_compile = False, reduce_retracing = True)
     def _compiled_training_loop_dataset(self, train_dataset, epochs,
                                         shuffle = True,
@@ -758,7 +870,7 @@ class ModelNN(keras.models.Model):
                     best_metric = current_loss
                     
                     # Update the existing variables inside the self.best_weights object.
-                    for i, w in enumerate(self.variables):
+                    for i, w in enumerate(self.weights):
                         self.best_weights[i].assign(w)
 
                     lr_wait = tf.constant(0, dtype = tf.int32)
@@ -776,8 +888,8 @@ class ModelNN(keras.models.Model):
                         tf.print("Restoring best weights...")
                     
                     # Restoring best weights
-                    for i, w in enumerate(self.variables):
-                        self.variables[i].assign(self.best_weights[i])
+                    for i, w in enumerate(self.weights):
+                        self.weights[i].assign( self.best_weights[i] )
     
                     convergence_reason = "stopped_improving"
                     stop_training = True
@@ -805,8 +917,8 @@ class ModelNN(keras.models.Model):
                                     tf.print("\nConvergence criterion reached. Stopping.")
                                     tf.print("Restoring best weights...")
                                 # Restoring best weights
-                                for i, w in enumerate(self.variables):
-                                    self.variables[i].assign(self.best_weights[i])
+                                for i, w in enumerate(self.weights):
+                                    self.weights[i].assign(self.best_weights[i])
 
                                 convergence_reason = "minimal_learning_rate"
                                 stop_training = True
@@ -1088,10 +1200,10 @@ class ModelNN(keras.models.Model):
                         best_metric_epoch = epoch
                         best_metric = current_loss
                         # best_weights = [tf.identity(w) for w in self.trainable_variables]
-                        # self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
+                        # self.best_weights = [tf.Variable(w, trainable = False) for w in self.weights]
     
                         # Do NOT create a new list. Update the existing variables in-place.
-                        for i, w in enumerate(self.variables):
+                        for i, w in enumerate(self.weights):
                             self.best_weights[i].assign(w)
     
                         lr_wait = tf.constant(0, dtype = tf.int32)
@@ -1106,8 +1218,8 @@ class ModelNN(keras.models.Model):
                         tf.print("\nConvergence criterion reached. Stopping.")
                         tf.print("Restoring best weights...")
                     # Restoring best weights
-                    for i, w in enumerate(self.variables):
-                        self.variables[i].assign(self.best_weights[i])
+                    for i, w in enumerate(self.weights):
+                        self.weights[i].assign(self.best_weights[i])
                         # tf.print(self.best_weights[i])
 
                     convergence_reason = "stopped_improving"
@@ -1136,8 +1248,8 @@ class ModelNN(keras.models.Model):
                                     tf.print("\nConvergence criterion reached. Stopping.")
                                     tf.print("Restoring best weights...")
                                 # Restoring best weights
-                                for i, w in enumerate(self.variables):
-                                    self.variables[i].assign(self.best_weights[i])
+                                for i, w in enumerate(self.weights):
+                                    self.weights[i].assign(self.best_weights[i])
                                     # tf.print(self.best_weights[i])
 
                                 convergence_reason = "minimal_learning_rate"
@@ -1217,6 +1329,7 @@ class ModelNN(keras.models.Model):
                     reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                     fine_tune = True,
                     get_covariances = True, covariance_jitter = 1.0e-6,
+                    finetune_epochs = None,
                     finetune_early_stopping = True, finetune_early_stopping_patience = 10,
                     finetune_early_stopping_warmup = 100,
                     finetune_reduce_lr = True, finetune_reduce_lr_warmup = 0, finetune_reduce_lr_factor = 0.5,
@@ -1277,10 +1390,9 @@ class ModelNN(keras.models.Model):
         start_time = time.time()
 
         # self.best_weights = [tf.Variable(w, trainable = False) for w in self.trainable_variables]
-        self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
+        self.best_weights = [tf.Variable(w, trainable = False) for w in self.weights]
         
         self.training = True
-
         # If self.data is not None, that means the user passed raw data to the model
         # tf.data.Datasets are not needed for training. That allows a faster training routine
         if(self.data is not None):
@@ -1341,7 +1453,7 @@ class ModelNN(keras.models.Model):
         self.best_metric = best_metric
 
         # Save the best weights previous to finetuning so we can compare metrics later if neccessary
-        self.pre_finetuning_best_weights = [ tf.Variable(w, trainable = False) for w in self.variables ]
+        self.pre_finetuning_best_weights = [ tf.Variable(w, trainable = False) for w in self.weights ]
         
         if(verbose):
             print("\nDone.")
@@ -1407,11 +1519,16 @@ class ModelNN(keras.models.Model):
             self.define_gradients()
             # Redefine the best weights object so they match the current trainable_variables structure
             # self.best_weights = [tf.Variable(w, trainable = False) for w in self.trainable_variables]
-            self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
+            self.best_weights = [tf.Variable(w, trainable = False) for w in self.weights]
 
             # During the fine-tuning phase, it is desired to obtain a local maxima for the log-likelihood.
             # Therefore, we necessarily fix the training data loss to be the observed metric for early stopping and learning rate reduction
             # We also remove the possibility of reducing the learning rate and to 
+
+            if(finetune_epochs is None):
+                finetune_epochs = epochs
+                
+            finetune_epochs = tf.constant(finetune_epochs, dtype = tf.int32)
             
             finetune_early_stopping_patience = tf.constant(finetune_early_stopping_patience, dtype = tf.int32)
             finetune_early_stopping_warmup = tf.constant(finetune_early_stopping_warmup, dtype = tf.int32)
@@ -1429,20 +1546,20 @@ class ModelNN(keras.models.Model):
                 # Compiled training routine
                 last_epoch, convergence_reason, loss_history, val_loss_history, \
                 nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_rawdata(
-                    self.x_train, self.data_train, epochs,
+                    self.x_train, self.data_train, finetune_epochs,
                     tf.constant(self.train_batch_size, dtype = tf.int32),
                     shuffle = shuffle,
                     validation = validation, x_val = self.x_val, data_val = self.data_val, force_training_validation = True,
-                    early_stopping = early_stopping,
-                    early_stopping_patience = early_stopping_patience,
-                    early_stopping_warmup = early_stopping_warmup,
-                    reduce_lr = reduce_lr,
-                    reduce_lr_warmup = reduce_lr_warmup,
-                    reduce_lr_factor = reduce_lr_factor,
-                    reduce_lr_min_delta = reduce_lr_min_delta,
-                    reduce_lr_patience = reduce_lr_patience,
-                    reduce_lr_cooldown = reduce_lr_cooldown,
-                    reduce_lr_min_lr = reduce_lr_min_lr,
+                    early_stopping = finetune_early_stopping,
+                    early_stopping_patience = finetune_early_stopping_patience,
+                    early_stopping_warmup = finetune_early_stopping_warmup,
+                    reduce_lr = finetune_reduce_lr,
+                    reduce_lr_warmup = finetune_reduce_lr_warmup,
+                    reduce_lr_factor = finetune_reduce_lr_factor,
+                    reduce_lr_min_delta = finetune_reduce_lr_min_delta,
+                    reduce_lr_patience = finetune_reduce_lr_patience,
+                    reduce_lr_cooldown = finetune_reduce_lr_cooldown,
+                    reduce_lr_min_lr = finetune_reduce_lr_min_lr,
                     deterministic = deterministic,
                     pre_training = False,
                     fine_tuning = True,
@@ -1451,8 +1568,8 @@ class ModelNN(keras.models.Model):
                 )
             else:
                 last_epoch, convergence_reason, loss_history, val_loss_history, \
-                nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_optimized(
-                    self.train_dataset, epochs,
+                nn_learning_rate_history, best_metric_epoch, best_metric = self._compiled_training_loop_dataset(
+                    self.train_dataset, finetune_epochs,
                     shuffle = shuffle,
                     validation = validation, val_dataset = self.val_dataset, force_training_validation = True,
                     early_stopping = finetune_early_stopping,
@@ -1516,8 +1633,6 @@ class ModelNN(keras.models.Model):
             print("Optimization finished in {:.3f} seconds.".format(execution_time))
 
 
-
-    
     def pre_train_model(self, epochs, x, data = None,
                         shuffle = True,
                         validation = False, n_train = None, n_val = None, x_val = None, data_val = None, val_prop = None, force_training_validation = False,
@@ -1602,7 +1717,7 @@ class ModelNN(keras.models.Model):
                 self.optimizer_nn.build( self.trainable_variables[len(self.independent_pars):] )
 
             # Initialize best weights object
-            self.best_weights = [tf.Variable(w, trainable = False) for w in self.variables]
+            self.best_weights = [tf.Variable(w, trainable = False) for w in self.weights]
             
             epochs = tf.constant(epochs, dtype = tf.int32)
 
@@ -2429,6 +2544,128 @@ class ModelNN(keras.models.Model):
             category = RuntimeWarning,
         )
         warnings.simplefilter("default", RuntimeWarning)
+
+    @tf.function(reduce_retracing=True)
+    def _compiled_covariance_dataset(self, dataset):
+        """
+        Executes the covariance extraction over an entire dataset purely in C++.
+        Uses tf.TensorArray to dynamically accumulate batches without memory explosions.
+        """
+        raw_cov_array = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        theta_cov_array = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        batch_index = tf.constant(0, dtype=tf.int32)
+
+        for batch_data in dataset:
+            if isinstance(batch_data, tuple):
+                x_batch = batch_data[0]
+            else:
+                x_batch = batch_data
+
+            # Compute the covariance structures for this specific batch
+            raw_cov_batch, theta_cov_batch = self._compute_covariance_math(x_batch)
+
+            raw_cov_array = raw_cov_array.write(batch_index, raw_cov_batch)
+            theta_cov_array = theta_cov_array.write(batch_index, theta_cov_batch)
+            batch_index += 1
+
+        return raw_cov_array.concat(), theta_cov_array.concat()
+
+    def _compute_covariance_math(self, x):
+        """
+        The core mathematical engine for calculating LLLA and Delta Method covariances.
+        Strictly utilizes TensorFlow native operations for AutoGraph compatibility.
+        """
+        b = self.independent_output_size
+        d = self.nn_output_size
+        H_tilde = None
+        Ib = None
+
+        if(self.neural_network_use and x is not None):
+            Y_2 = self.neural_network_call_nolast(self, x)
+
+            # Replaced x.shape[0] with tf.shape(x)[0] for dynamic graph compatibility
+            m = tf.shape(x)[0] 
+            k = Y_2.shape[-1] 
+
+            H_tilde = tf.einsum("ij, ...kl -> ...ijkl", tf.eye(d), Y_2[:,:,None])
+            H_tilde = tf.reshape(H_tilde, (m, d, k*d))
+
+            if(self.bias_use):
+                Id = tf.tile(tf.eye(d)[None,:,:], (m, 1, 1))
+                H_tilde = tf.concat([H_tilde, Id], axis=-1)
+
+        if(self.independent_pars_use):
+            Ib = tf.eye(b)
+            if self.neural_network_use and x is not None:
+                Ib = tf.reshape(Ib, (1, b, b))
+                Ib = tf.tile(Ib, [m, 1, 1])
+
+        if(self.independent_pars_use and H_tilde is not None):
+            Ib_op = tf.linalg.LinearOperatorFullMatrix(Ib)
+            H_tilde_op = tf.linalg.LinearOperatorFullMatrix(H_tilde)
+            H = tf.linalg.LinearOperatorBlockDiag([Ib_op, H_tilde_op]).to_dense()
+
+            # Replaced self.get_weights() with self.weights for C++ graph tracking
+            independent_pars = tf.concat([tf.reshape(v, [-1]) for v in self.weights[:len(self.independent_pars)]], axis=0)
+            independent_pars = tf.reshape(independent_pars, (1, self.independent_output_size))
+            independent_pars = tf.tile(independent_pars, [m, 1])
+
+            nn_pars = self.layers[-1](Y_2)
+
+            raw_pars = tf.concat([independent_pars, nn_pars], axis=1)
+            raw_cov = tf.einsum("...il, lj, ...ju -> ...iu", H, self.weights_covariance, tf.transpose(H, perm=[0,2,1]))
+
+        elif(self.independent_pars_use and H_tilde is None):
+            independent_pars = tf.concat([tf.reshape(v, [-1]) for v in self.weights[:len(self.independent_pars)]], axis=0)
+            raw_pars = tf.reshape(independent_pars, (1, self.independent_output_size))
+            raw_cov = self.weights_covariance[:self.independent_output_size, :self.independent_output_size]
+            # Enforce batch dimension so the Delta einsum broadcasts perfectly in C++
+            raw_cov = tf.expand_dims(raw_cov, axis=0)
+
+        else:
+            raw_pars = self.layers[-1](Y_2)
+            raw_cov = tf.einsum("...il, lj, ...ju -> ...iu", H_tilde, self.weights_covariance, tf.transpose(H_tilde, perm=[0,2,1]))
+
+        with tf.GradientTape() as tape:
+            tape.watch(raw_pars)
+            theta_pars = self.apply_link(raw_pars)
+
+        J = tape.batch_jacobian(theta_pars, raw_pars)
+        theta_cov = tf.einsum("...il, ...lj, ...ju -> ...iu", J, raw_cov, tf.transpose(J, perm=[0,2,1]))
+
+        return raw_cov, theta_cov
+
+    def covariance_output(self, x = None):
+        """
+            Given an input, x (raw arrays or tf.data.Dataset), obtains the asymptotic 
+            covariance matrices for the model weights estimators.
+            If x is not given, returns only the covariance matrix from the independent parameters.
+        """
+        # 1. Handle tf.data.Dataset (The Massive C++ Batch Route)
+        if(isinstance(x, tf.data.Dataset)):
+            return self._compiled_covariance_dataset(x)
+
+        # 2. Handle missing x (Independent parameters only)
+        if(x is None):
+            if not self.independent_pars_use:
+                raise TypeError("Please, provide a list of input values, x.")
+            else:
+                warnings.simplefilter("always", UserWarning)
+                warnings.warn(
+                    "Model supports both neural network modeled parameters and independent parameters.\n" + \
+                    "As a list of input values, x, was not provided, obtaining the covariances only for {}.".format(self.independent_pars),
+                    category = UserWarning,
+                )
+                warnings.simplefilter("default", UserWarning)
+            # Route to math with x=None
+            return self._compute_covariance_math(None)
+
+        # 3. Handle Raw Numpy Arrays / Tensors (Single massive batch)
+        x_input = tf.cast(x, dtype=tf.float32)
+        if(len(x_input.shape) == 1):
+            x_input = tf.reshape(x_input, shape=(len(x_input), 1))
+
+        return self._compute_covariance_math(x_input)
                 
 
     def apply_link(self, raw_pars):
@@ -2461,278 +2698,501 @@ class ModelNN(keras.models.Model):
         pars = tf.concat(link_evaluations, axis = 1)
         return pars
         
-    def covariance_output(self, x = None):
-        """
-            Given an input, x, obtain the asymptotic covariance matrices for the model weights estimators.
-            If x is not given, return only the covariance matrix from the independent parameters, that are constant for every input.
-        """
-        if(x is not None):
-            x = tf.cast(x, dtype = tf.float32)
-            # If input is a vector, transform it into a column
-            if(len(x.shape) == 1):
-                x = tf.reshape( x, shape = (len(x), 1) )
+    # def covariance_output(self, x = None):
+    #     """
+    #         Given an input, x, obtain the asymptotic covariance matrices for the model weights estimators.
+    #         If x is not given, return only the covariance matrix from the independent parameters, that are constant for every input.
+    #     """
+    #     if(x is not None):
+    #         x = tf.cast(x, dtype = tf.float32)
+    #         # If input is a vector, transform it into a column
+    #         if(len(x.shape) == 1):
+    #             x = tf.reshape( x, shape = (len(x), 1) )
         
-        # Number of independent parameter values as outputs (may be different from len(self.independent_pars), if vectors are considered)
-        b = self.independent_output_size
-        # Number of parameters as outputs to the neural network (may be different from len(self.nn_pars), if vectors are considered)
-        d = self.nn_output_size
+    #     # Number of independent parameter values as outputs (may be different from len(self.independent_pars), if vectors are considered)
+    #     b = self.independent_output_size
+    #     # Number of parameters as outputs to the neural network (may be different from len(self.nn_pars), if vectors are considered)
+    #     d = self.nn_output_size
 
-        # I_d \otimes Y^{(-2)} matrix for neural network weights
-        H_tilde = None
-        # I_b identity matrix for independent components covariance
-        Ib = None
+    #     # I_d \otimes Y^{(-2)} matrix for neural network weights
+    #     H_tilde = None
+    #     # I_b identity matrix for independent components covariance
+    #     Ib = None
         
-        if(self.neural_network_use):
-            # If there are no independent parameters and also no input x was given, raise an Error
-            if(not self.independent_pars_use and x is None):
-                raise TypeError("Please, provide a list of input values, x.")
-            elif(x is None):
-                warnings.simplefilter("always", UserWarning)
-                warnings.warn(
-                    "Model supports both neural network modeled parameters and independent parameters.\n" + \
-                    "As a list of input values, x, was not provided, obtaining the covariances only for {}.".format(self.independent_pars),
-                    category = UserWarning,
-                )
-                warnings.simplefilter("default", UserWarning)
-            # If there are independent pars and x was given, simply obtain tilde{H} = I_d \otimes Y^{(-2)}
-            else:
-                x = tf.cast(x, dtype = tf.float32)
-                # Let m be the number of entries in x
-                # Y^{(-2)} dimension: (m, n_neurons_last_layer)
-                Y_2 = self.neural_network_call_nolast(self, x)
+    #     if(self.neural_network_use):
+    #         # If there are no independent parameters and also no input x was given, raise an Error
+    #         if(not self.independent_pars_use and x is None):
+    #             raise TypeError("Please, provide a list of input values, x.")
+    #         elif(x is None):
+    #             warnings.simplefilter("always", UserWarning)
+    #             warnings.warn(
+    #                 "Model supports both neural network modeled parameters and independent parameters.\n" + \
+    #                 "As a list of input values, x, was not provided, obtaining the covariances only for {}.".format(self.independent_pars),
+    #                 category = UserWarning,
+    #             )
+    #             warnings.simplefilter("default", UserWarning)
+    #         # If there are independent pars and x was given, simply obtain tilde{H} = I_d \otimes Y^{(-2)}
+    #         else:
+    #             x = tf.cast(x, dtype = tf.float32)
+    #             # Let m be the number of entries in x
+    #             # Y^{(-2)} dimension: (m, n_neurons_last_layer)
+    #             Y_2 = self.neural_network_call_nolast(self, x)
                 
-                # Take the final layer weights and flatten then column-wise (each column stacked on top of the other) -> IMPORTANT! MUST MATCH HESSIAN CALCULATIONS!
-                W = np.transpose( self.get_weights()[-1] ).flatten()
+    #             # Take the final layer weights and flatten then column-wise (each column stacked on top of the other) -> IMPORTANT! MUST MATCH HESSIAN CALCULATIONS!
+    #             W = np.transpose( self.get_weights()[-1] ).flatten()
         
-                m = x.shape[0] # Number of inputs
-                k = Y_2.shape[-1] # Number of neurons on the penultimate layer
+    #             m = x.shape[0] # Number of inputs
+    #             k = Y_2.shape[-1] # Number of neurons on the penultimate layer
                 
-                # For each entry, x_i, we need to obtain I_d \otimes Y^{(-2)}(x_i)
-                # To do that, we must consider the Einstein summation formula, since np.kron always suppose 2d matrices
-                # \tilde{H} = I_d \otimes Y^{(-2)}(x_i)
-                # Therefore, H must have dimensions (m, d, kd) as it represents the transformation from the weights (normally distributed)
-                # to the neural network output, considering multiplication with the penultimate layer, Y_2
-                H_tilde = tf.einsum("ij, ...kl -> ...ijkl", tf.eye(d), Y_2[:,:,None]) # (m, d, k, d, 1) tensor
-                H_tilde = tf.reshape(H_tilde, (m, d, k*d))
+    #             # For each entry, x_i, we need to obtain I_d \otimes Y^{(-2)}(x_i)
+    #             # To do that, we must consider the Einstein summation formula, since np.kron always suppose 2d matrices
+    #             # \tilde{H} = I_d \otimes Y^{(-2)}(x_i)
+    #             # Therefore, H must have dimensions (m, d, kd) as it represents the transformation from the weights (normally distributed)
+    #             # to the neural network output, considering multiplication with the penultimate layer, Y_2
+    #             H_tilde = tf.einsum("ij, ...kl -> ...ijkl", tf.eye(d), Y_2[:,:,None]) # (m, d, k, d, 1) tensor
+    #             H_tilde = tf.reshape(H_tilde, (m, d, k*d))
                 
-                # If there is a bias on the last layer, concatenate a I_d matrix to H_tilde
-                if(self.bias_use):
-                    # Create an (m,d,d) tensor with I_d in each m index
-                    Id = tf.tile(tf.eye(d)[None,:,:], (m, 1, 1))
-                    H_tilde = tf.concat([H_tilde, Id], axis = -1)
+    #             # If there is a bias on the last layer, concatenate a I_d matrix to H_tilde
+    #             if(self.bias_use):
+    #                 # Create an (m,d,d) tensor with I_d in each m index
+    #                 Id = tf.tile(tf.eye(d)[None,:,:], (m, 1, 1))
+    #                 H_tilde = tf.concat([H_tilde, Id], axis = -1)
 
-        if(self.independent_pars_use):
-            Ib = tf.eye(b)
-            if(self.neural_network_use and x is not None):
-                Ib = tf.reshape(Ib, (1, b, b))
-                Ib = tf.tile(Ib, [m, 1, 1])
+    #     if(self.independent_pars_use):
+    #         Ib = tf.eye(b)
+    #         if(self.neural_network_use and x is not None):
+    #             Ib = tf.reshape(Ib, (1, b, b))
+    #             Ib = tf.tile(Ib, [m, 1, 1])
         
-        # Ib exists and H_tilde exists
-        if(self.independent_pars_use and H_tilde is not None):
-            Ib = tf.linalg.LinearOperatorFullMatrix(Ib)
-            H_tilde = tf.linalg.LinearOperatorFullMatrix(H_tilde)
-            H = tf.linalg.LinearOperatorBlockDiag([Ib, H_tilde]).to_dense()
+    #     # Ib exists and H_tilde exists
+    #     if(self.independent_pars_use and H_tilde is not None):
+    #         Ib = tf.linalg.LinearOperatorFullMatrix(Ib)
+    #         H_tilde = tf.linalg.LinearOperatorFullMatrix(H_tilde)
+    #         H = tf.linalg.LinearOperatorBlockDiag([Ib, H_tilde]).to_dense()
             
-            # Cycle through all independent parameters and flatten their values into a single vector of real values
-            independent_pars = tf.concat([ tf.reshape(v, [-1]) for v in self.get_weights()[:len(self.independent_pars)] ], axis = 0)
-            independent_pars = tf.reshape(independent_pars, (1, self.independent_output_size))
-            independent_pars = tf.tile(independent_pars, [m, 1])
-            # Obtain the raw expression for each parameter modeled as a nn output
-            nn_pars = self.layers[-1](Y_2)
+    #         # Cycle through all independent parameters and flatten their values into a single vector of real values
+    #         independent_pars = tf.concat([ tf.reshape(v, [-1]) for v in self.get_weights()[:len(self.independent_pars)] ], axis = 0)
+    #         independent_pars = tf.reshape(independent_pars, (1, self.independent_output_size))
+    #         independent_pars = tf.tile(independent_pars, [m, 1])
+    #         # Obtain the raw expression for each parameter modeled as a nn output
+    #         nn_pars = self.layers[-1](Y_2)
 
-            # Concatenate all parameters into a single vector. It will be used to get the gradients to the link functions
-            raw_pars = tf.concat([independent_pars, nn_pars], axis = 1)
-            raw_cov = tf.einsum("...il, lj, ...ju -> ...iu", H, self.weights_covariance, tf.transpose(H, perm = [0,2,1]))
-        # Ib exists and H_tilde do not
-        elif(self.independent_pars_use and H_tilde is None):
-            # Cycle through all independent parameters and flatten their values into a single vector of real values
-            independent_pars = tf.concat([ tf.reshape(v, [-1]) for v in self.get_weights()[:len(self.independent_pars)] ], axis = 0)
-            raw_pars = tf.reshape(independent_pars, (1, self.independent_output_size))
-            raw_cov = self.weights_covariance[:self.independent_output_size, :self.independent_output_size]
-        # Ib do not exist and H_tilde does (consequently, x was given)
-        else:
-            raw_pars = self.layers[-1](Y_2)
-            raw_cov = tf.einsum("...il, lj, ...ju -> ...iu", H_tilde, self.weights_covariance, tf.transpose(H_tilde, perm = [0,2,1]))
+    #         # Concatenate all parameters into a single vector. It will be used to get the gradients to the link functions
+    #         raw_pars = tf.concat([independent_pars, nn_pars], axis = 1)
+    #         raw_cov = tf.einsum("...il, lj, ...ju -> ...iu", H, self.weights_covariance, tf.transpose(H, perm = [0,2,1]))
+    #     # Ib exists and H_tilde do not
+    #     elif(self.independent_pars_use and H_tilde is None):
+    #         # Cycle through all independent parameters and flatten their values into a single vector of real values
+    #         independent_pars = tf.concat([ tf.reshape(v, [-1]) for v in self.get_weights()[:len(self.independent_pars)] ], axis = 0)
+    #         raw_pars = tf.reshape(independent_pars, (1, self.independent_output_size))
+    #         raw_cov = self.weights_covariance[:self.independent_output_size, :self.independent_output_size]
+    #     # Ib do not exist and H_tilde does (consequently, x was given)
+    #     else:
+    #         raw_pars = self.layers[-1](Y_2)
+    #         raw_cov = tf.einsum("...il, lj, ...ju -> ...iu", H_tilde, self.weights_covariance, tf.transpose(H_tilde, perm = [0,2,1]))
         
-        # Compute the Jacobian J for link functions over each individual
-        with tf.GradientTape() as tape:
-            tape.watch(raw_pars)
-            theta_pars = self.apply_link( raw_pars )
+    #     # Compute the Jacobian J for link functions over each individual
+    #     with tf.GradientTape() as tape:
+    #         tape.watch(raw_pars)
+    #         theta_pars = self.apply_link( raw_pars )
 
-        # Delta method implementation for all parameters
-        # (m, b+d, b+d)
-        J = tape.batch_jacobian(theta_pars, raw_pars)
+    #     # Delta method implementation for all parameters
+    #     # (m, b+d, b+d)
+    #     J = tape.batch_jacobian(theta_pars, raw_pars)
         
-        # Obtain the covariance matrices for the transformed estimators according to the delta method
-        theta_cov = tf.einsum("...il, ...lj, ...ju -> ...iu", J, raw_cov, tf.transpose(J, perm = [0,2,1]))
+    #     # Obtain the covariance matrices for the transformed estimators according to the delta method
+    #     theta_cov = tf.einsum("...il, ...lj, ...ju -> ...iu", J, raw_cov, tf.transpose(J, perm = [0,2,1]))
         
-        return raw_cov, theta_cov
+    #     return raw_cov, theta_cov
 
-    def summary(self, x = None, alpha = 0.05):
-        pars_summary = {"index": [1]}
+    # def summary(self, x = None, alpha = 0.05):
+    #     pars_summary = {"index": [1]}
+    #     nn_output = None
+    #     if(x is not None):
+    #         x = tf.cast(x, dtype = tf.float32)
+    #         # If input is a vector, transform it into a column
+    #         if(len(x.shape) == 1):
+    #             x = tf.reshape( x, shape = (len(x), 1) )
+    #         pars_summary = {"index": np.arange(len(x))+1}
+
+    #         # Evaluate the neural network for all x values
+    #         if(self.neural_network_use):
+    #             nn_output = self(x, training = False)
+            
+    #     # Obtain the covariance matrices for all inputs, x
+    #     raw_cov, theta_cov = self.covariance_output(x)
+    #     z_norm = norm.ppf(1-alpha/2)
+        
+    #     for i in range(theta_cov.shape[1]):
+    #         if(i < self.independent_output_size):
+    #             # Take the name of the parameter in this respective position
+    #             par_index_var = self.independent_index_to_vars[i][4:] # Remove the raw_ prefix
+    #         else:
+    #             j = i - self.independent_output_size
+    #             par_index_var = self.nn_index_to_vars[j][4:]
+    #             # nn_output = self(x, training = False)
+        
+    #         par_index_var_split = par_index_var.split("[")
+    #         par_name = par_index_var_split[0]
+    #         # If name matches the index_to_vars result, parameter is a single number (not a vector)
+    #         if(par_name == par_index_var):
+    #             par_index = 0
+    #         else:
+    #             par_index = int( par_index_var_split[-1].split("]")[0] )
+
+    #         if(i < self.independent_output_size):
+    #             raw_par_value = np.repeat( self.get_variable(par_name, nn_output, get_raw_value = True, force_true = True)[par_index], theta_cov.shape[0] )
+    #         else:
+    #             raw_par_value = self.get_variable(par_name, nn_output, get_raw_value = True, force_true = True)[:,par_index]
+            
+    #         par_value = self.parameters[par_name]["link"]( raw_par_value )
+    #         # Raw parameter variance (Last-Layer Laplace Approximations - LLLA)
+    #         raw_par_se = np.sqrt(raw_cov[:,i,i])
+    #         # Final parameter variance (Delta method)
+    #         par_se = np.sqrt(theta_cov[:,i,i])
+    #         raw_par_lower = raw_par_value - z_norm * raw_par_se
+    #         raw_par_upper = raw_par_value + z_norm * raw_par_se
+
+    #         par_lower = self.parameters[par_name]["link"]( raw_par_lower )
+    #         par_upper = self.parameters[par_name]["link"]( raw_par_upper )
+
+    #         pars_summary[par_index_var] = par_value
+    #         pars_summary[par_index_var + "_se"] = par_se
+    #         pars_summary[par_index_var + "_lower"] = par_lower
+    #         pars_summary[par_index_var + "_upper"] = par_upper
+            
+    #     return pd.DataFrame(pars_summary)
+
+    def summary(self, x=None, alpha=0.05):
+        """
+        Generates a Pandas DataFrame containing the parameter estimates, standard errors, 
+        and confidence intervals (via Delta Method). 
+        Accepts raw tensors, numpy arrays, or tf.data.Dataset.
+        """
+        pars_summary = {}
         nn_output = None
-        if(x is not None):
-            x = tf.cast(x, dtype = tf.float32)
-            # If input is a vector, transform it into a column
-            if(len(x.shape) == 1):
-                x = tf.reshape( x, shape = (len(x), 1) )
-            pars_summary = {"index": np.arange(len(x))+1}
-
-            # Evaluate the neural network for all x values
-            if(self.neural_network_use):
-                nn_output = self(x, training = False)
-            
-        # Obtain the covariance matrices for all inputs, x
-        raw_cov, theta_cov = self.covariance_output(x)
-        z_norm = norm.ppf(1-alpha/2)
         
+        # 1. Handle tf.data.Dataset
+        if isinstance(x, tf.data.Dataset):
+            # Fire the compiled loops to process the massive dataset in C++
+            if self.neural_network_use:
+                nn_output = self._compiled_predict_dataset(x)
+                
+            raw_cov, theta_cov = self.covariance_output(x)
+            n_samples = raw_cov.shape[0]
+            pars_summary["index"] = np.arange(n_samples) + 1
+            
+        # 2. Handle missing x (Independent parameters only)
+        elif x is None:
+            raw_cov, theta_cov = self.covariance_output(None)
+            n_samples = 1
+            pars_summary["index"] = [1]
+            
+        # 3. Handle Raw Numpy Arrays / Tensors
+        else:
+            x_input = tf.cast(x, dtype=tf.float32)
+            if len(x_input.shape) == 1:
+                x_input = tf.reshape(x_input, shape=(len(x_input), 1))
+                
+            if self.neural_network_use:
+                nn_output = self(x_input, training=False)
+                
+            raw_cov, theta_cov = self.covariance_output(x_input)
+            n_samples = x_input.shape[0]
+            pars_summary["index"] = np.arange(n_samples) + 1
+
+        # Calculate the normal multiplier for the confidence bounds
+        z_norm = norm.ppf(1 - alpha / 2)
+        
+        # 4. Vectorized parameter extraction and Delta method boundaries
         for i in range(theta_cov.shape[1]):
-            if(i < self.independent_output_size):
-                # Take the name of the parameter in this respective position
-                par_index_var = self.independent_index_to_vars[i][4:] # Remove the raw_ prefix
+            # Identify the parameter name and its vector index
+            if i < self.independent_output_size:
+                par_index_var = self.independent_index_to_vars[i][4:] # Remove raw_ prefix
             else:
                 j = i - self.independent_output_size
                 par_index_var = self.nn_index_to_vars[j][4:]
-                # nn_output = self(x, training = False)
         
             par_index_var_split = par_index_var.split("[")
             par_name = par_index_var_split[0]
-            # If name matches the index_to_vars result, parameter is a single number (not a vector)
-            if(par_name == par_index_var):
+            
+            if par_name == par_index_var:
                 par_index = 0
             else:
-                par_index = int( par_index_var_split[-1].split("]")[0] )
+                par_index = int(par_index_var_split[-1].split("]")[0])
 
-            if(i < self.independent_output_size):
-                raw_par_value = np.repeat( self.get_variable(par_name, nn_output, get_raw_value = True, force_true = True)[par_index], theta_cov.shape[0] )
+            # Extract the raw parameter (Before the link function)
+            if i < self.independent_output_size:
+                # Independent parameters are constant, so we repeat them for the sample size
+                raw_scalar = self.get_variable(par_name, nn_output, get_raw_value=True, force_true=True)[par_index]
+                raw_par_value = tf.repeat(raw_scalar, n_samples)
             else:
-                raw_par_value = self.get_variable(par_name, nn_output, get_raw_value = True, force_true = True)[:,par_index]
+                raw_par_value = self.get_variable(par_name, nn_output, get_raw_value=True, force_true=True)[:, par_index]
             
-            par_value = self.parameters[par_name]["link"]( raw_par_value )
-            # Raw parameter variance (Last-Layer Laplace Approximations - LLLA)
-            raw_par_se = np.sqrt(raw_cov[:,i,i])
-            # Final parameter variance (Delta method)
-            par_se = np.sqrt(theta_cov[:,i,i])
+            # 1. Transform raw parameter to natural scale
+            par_value = self.parameters[par_name]["link"](raw_par_value)
+            
+            # 2. Extract standard errors
+            raw_par_se = tf.sqrt(raw_cov[:, i, i])
+            par_se = tf.sqrt(theta_cov[:, i, i])
+            
+            # 3. Calculate Confidence Intervals in the unrestricted Raw (LLLA) space
             raw_par_lower = raw_par_value - z_norm * raw_par_se
             raw_par_upper = raw_par_value + z_norm * raw_par_se
 
-            par_lower = self.parameters[par_name]["link"]( raw_par_lower )
-            par_upper = self.parameters[par_name]["link"]( raw_par_upper )
+            # 4. Apply inverse link to boundaries to map them back to the constrained Natural space
+            par_lower = self.parameters[par_name]["link"](raw_par_lower)
+            par_upper = self.parameters[par_name]["link"](raw_par_upper)
 
-            pars_summary[par_index_var] = par_value
-            pars_summary[par_index_var + "_se"] = par_se
-            pars_summary[par_index_var + "_lower"] = par_lower
-            pars_summary[par_index_var + "_upper"] = par_upper
+            # Extract to numpy arrays safely to prevent tf.Tensor memory leaks in Pandas
+            pars_summary[par_index_var] = par_value.numpy() if hasattr(par_value, 'numpy') else par_value
+            pars_summary[par_index_var + "_se"] = par_se.numpy() if hasattr(par_se, 'numpy') else par_se
+            pars_summary[par_index_var + "_lower"] = par_lower.numpy() if hasattr(par_lower, 'numpy') else par_lower
+            pars_summary[par_index_var + "_upper"] = par_upper.numpy() if hasattr(par_upper, 'numpy') else par_upper
             
         return pd.DataFrame(pars_summary)
     
-    def variable_function_covariance(self, fun, data, x = None):
+    # def variable_function_covariance(self, fun, data, x = None):
+    #     """
+    #         Receives a single dimensional function of independent and nn parameters and return its corresponding variance for all observations queried
+    #     """
+    #     nn_output = None
+    #     if(x is not None):
+    #         x = tf.cast(x, dtype = tf.float32)
+    #         # If input is a vector, transform it into a column
+    #         if(len(x.shape) == 1):
+    #             x = tf.reshape( x, shape = (len(x), 1) )
+
+    #         # Obtain the network raw output
+    #         nn_output = self(x)
+        
+    #     # Obtain the covariance matrices for all inputs, x
+    #     raw_cov, theta_cov = self.covariance_output(x)
+        
+    #     # Initialize gradient tracker for parameters
+    #     self._delta_tape = tf.GradientTape(persistent=True)
+    #     self._tracked_theta_tensors = {}
+
+    #     data = [x] + data
+        
+    #     # Run the user's function with _delta_tape as context
+    #     with self._delta_tape:
+    #         f_theta = fun(self, nn_output, data)
+    #         # Ensures the output from fun is atleast two dimensional
+    #         if(len(f_theta.shape) == 1):
+    #             f_theta = tf.expand_dims(f_theta, axis = -1)
+        
+    #     ordered_theta_var_names = []
+    #     ordered_theta_tensors = []
+    #     # Tracks which parameters from the model were used in fun and which were not
+    #     theta_used = {}
+    #     # Goes through all variables in the order they appear in the covariance matrix
+    #     for i in range(self.independent_output_size + self.nn_output_size):
+    #         if(i < self.independent_output_size):
+    #             # Get only the name of the variable
+    #             var_name = self.independent_index_to_vars[i][4:].split("[")[0]
+    #         else:
+    #             var_name = self.nn_index_to_vars[i-self.independent_output_size][4:].split("[")[0]
+
+    #         # In case the variable has shape > 1, we ensure it gets added only once in this list
+    #         if(var_name not in theta_used):
+    #             # If variable was used in fun, add it on its correct order to the list
+    #             if(var_name in self._tracked_theta_tensors):
+    #                 ordered_theta_tensors.append( self._tracked_theta_tensors[var_name] )
+    #                 theta_used[ var_name ] = True
+    #             # If given variable was not used in fun, just include a None (the Jacobian will have a column full of zeros)
+    #             else:
+    #                 # ordered_theta_tensors.append( None )
+    #                 theta_used[ var_name ] = False
+                    
+    #     J_list = []
+        
+    #     used_counter = 0
+    #     # Now that the Jacobians were obtained, we fix each one of them to match a proper matrix, J
+    #     for i, parameter in enumerate(theta_used):
+    #         # If parameter was used in fun
+    #         if( theta_used[parameter] ):
+    #             # If parameter is independent get the full jacobian, since it is the same for every observation
+    #             if( parameter in self.independent_pars ):
+    #                 parameter_jacobian = self._delta_tape.jacobian(f_theta, ordered_theta_tensors[ used_counter ], experimental_use_pfor = False)
+    #                 # print("JACOBIAN", parameter, ":", parameter_jacobian)
+    #                 # If first dimension of jacobian does not match data dimension and we know for sure there are input observations, x
+    #                 if( (parameter_jacobian is not None) and (x is not None and self.neural_network_use) and (parameter_jacobian.shape[0] != x.shape[0]) ):
+    #                     parameter_jacobian = tf.broadcast_to(parameter_jacobian, (x.shape[0], 1, 1))
+                    
+    #             # If parameter is output from the network, get the batch_jacobian instead
+    #             elif( parameter in self.nn_pars ):
+    #                 try:
+    #                     parameter_jacobian = self._delta_tape.batch_jacobian(f_theta, ordered_theta_tensors[ used_counter ], experimental_use_pfor = False)
+    #                 except ValueError:
+    #                     parameter_jacobian = None
+    #             # Increase the counter for the next used parameter in ordered_theta_tensors
+    #             used_counter += 1
+    #             # If get_variable was called, but parameter was not used, the jacobian still returns None
+    #             if(parameter_jacobian is None):
+    #                 if(x is not None):
+    #                     jacobian_zeros = tf.zeros((x.shape[0], f_theta.shape[1], self.parameters[parameter]["shape"]))
+    #                 else:
+    #                     jacobian_zeros = tf.zeros((1, f_theta.shape[1], self.parameters[parameter]["shape"]))
+    #                 parameter_jacobian = jacobian_zeros
+                    
+    #             J_list.append( parameter_jacobian )
+    #         # If parameter was not used, we must impute its shape of zeros in the Jacobian matrix
+    #         else:
+    #             if(x is not None):
+    #                 jacobian_zeros = tf.zeros((x.shape[0], f_theta.shape[1], self.parameters[parameter]["shape"]))
+    #             else:
+    #                 jacobian_zeros = tf.zeros((1, f_theta.shape[1], self.parameters[parameter]["shape"]))
+    #             J_list.append( jacobian_zeros )
+
+        
+    #     # Concatenate all gradients into the jacobian matrix and virtually increase one dimension for following operation
+    #     J = tf.concat(J_list, axis = -1)
+        
+    #     # 5. Clean up the state so it doesn't interfere with standard training
+    #     self._delta_tape = None
+    #     self._tracked_theta_tensors = None
+        
+    #     # Finally, with the Jacobian ordered and ready, the covariance matrix for function fun is J theta_cov J^T from the Delta method
+    #     # This operation is simply expressed in terms of the Einstein summation convention given below
+    #     fun_cov = tf.einsum("...il, ...lj, ...ju -> ...iu", J, theta_cov, tf.transpose(J, perm = [0,2,1]))
+        
+    #     return fun_cov
+        
+    @tf.function(reduce_retracing=True)
+    def _compiled_variable_function_covariance_dataset(self, fun, dataset, extra_data):
         """
-            Receives a single dimensional function of independent and nn parameters and return its corresponding variance for all observations queried
+        Executes the function covariance extraction over an entire dataset purely in C++.
+        Uses tf.TensorArray to dynamically accumulate the Delta method variances.
+        """
+        fun_cov_array = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+        batch_index = tf.constant(0, dtype=tf.int32)
+
+        for batch_data in dataset:
+            # Unpack the batch safely
+            if isinstance(batch_data, tuple):
+                x_batch = batch_data[0]
+                batch_extra = list(batch_data[1:])
+            else:
+                x_batch = batch_data
+                batch_extra = []
+            
+            # Combine any dataset-yielded extra data with the python-level extra_data
+            current_data = batch_extra + extra_data
+
+            # Compute the covariance structures for this specific batch
+            fun_cov_batch = self._compute_variable_function_covariance_math(fun, current_data, x = x_batch)
+            fun_cov_array = fun_cov_array.write(batch_index, fun_cov_batch)
+            batch_index += 1
+
+        return fun_cov_array.concat()
+
+    def _compute_variable_function_covariance_math(self, fun, data, x=None):
+        """
+        The core mathematical engine for calculating the Jacobian and Delta Method variance 
+        for an arbitrary user-defined function.
         """
         nn_output = None
         if(x is not None):
-            x = tf.cast(x, dtype = tf.float32)
-            # If input is a vector, transform it into a column
-            if(len(x.shape) == 1):
-                x = tf.reshape( x, shape = (len(x), 1) )
+            x = tf.cast(x, dtype=tf.float32)
+            if len(x.shape) == 1:
+                x = tf.reshape(x, shape=(tf.shape(x)[0], 1))
+            nn_output = self(x, training = False)
+            batch_size = tf.shape(x)[0] # Dynamic shape tracking for C++
+        else:
+            batch_size = 1
+            
+        # Route directly to the math engine to avoid wrapper overhead inside the graph
+        if(x is not None):
+            raw_cov, theta_cov = self._compute_covariance_math(x)
+        else:
+            raw_cov, theta_cov = self._compute_covariance_math(None)
 
-            # Obtain the network raw output
-            nn_output = self(x)
-        
-        # Obtain the covariance matrices for all inputs, x
-        raw_cov, theta_cov = self.covariance_output(x)
-        
-        # Initialize gradient tracker for parameters
         self._delta_tape = tf.GradientTape(persistent=True)
         self._tracked_theta_tensors = {}
 
-        data = [x] + data
+        data_with_x = [x] + data
         
-        # Run the user's function with _delta_tape as context
         with self._delta_tape:
-            f_theta = fun(self, nn_output, data)
-            # Ensures the output from fun is atleast two dimensional
-            if(len(f_theta.shape) == 1):
-                f_theta = tf.expand_dims(f_theta, axis = -1)
-        
-        ordered_theta_var_names = []
+            f_theta = fun(self, nn_output, data_with_x)
+            if len(f_theta.shape) == 1:
+                f_theta = tf.expand_dims(f_theta, axis=-1)
+
         ordered_theta_tensors = []
-        # Tracks which parameters from the model were used in fun and which were not
         theta_used = {}
-        # Goes through all variables in the order they appear in the covariance matrix
+        
         for i in range(self.independent_output_size + self.nn_output_size):
-            if(i < self.independent_output_size):
-                # Get only the name of the variable
+            if i < self.independent_output_size:
                 var_name = self.independent_index_to_vars[i][4:].split("[")[0]
             else:
                 var_name = self.nn_index_to_vars[i-self.independent_output_size][4:].split("[")[0]
 
-            # In case the variable has shape > 1, we ensure it gets added only once in this list
-            if(var_name not in theta_used):
-                # If variable was used in fun, add it on its correct order to the list
-                if(var_name in self._tracked_theta_tensors):
-                    ordered_theta_tensors.append( self._tracked_theta_tensors[var_name] )
-                    theta_used[ var_name ] = True
-                # If given variable was not used in fun, just include a None (the Jacobian will have a column full of zeros)
+            if var_name not in theta_used:
+                if var_name in self._tracked_theta_tensors:
+                    ordered_theta_tensors.append(self._tracked_theta_tensors[var_name])
+                    theta_used[var_name] = True
                 else:
-                    # ordered_theta_tensors.append( None )
-                    theta_used[ var_name ] = False
+                    theta_used[var_name] = False
                     
         J_list = []
-        
         used_counter = 0
-        # Now that the Jacobians were obtained, we fix each one of them to match a proper matrix, J
+        
         for i, parameter in enumerate(theta_used):
-            # If parameter was used in fun
-            if( theta_used[parameter] ):
-                # If parameter is independent get the full jacobian, since it is the same for every observation
-                if( parameter in self.independent_pars ):
-                    parameter_jacobian = self._delta_tape.jacobian(f_theta, ordered_theta_tensors[ used_counter ], experimental_use_pfor = False)
-                    # print("JACOBIAN", parameter, ":", parameter_jacobian)
-                    # If first dimension of jacobian does not match data dimension and we know for sure there are input observations, x
-                    if( (parameter_jacobian is not None) and (x is not None and self.neural_network_use) and (parameter_jacobian.shape[0] != x.shape[0]) ):
-                        parameter_jacobian = tf.broadcast_to(parameter_jacobian, (x.shape[0], 1, 1))
+            if theta_used[parameter]:
+                if parameter in self.independent_pars:
+                    parameter_jacobian = self._delta_tape.jacobian(f_theta, ordered_theta_tensors[used_counter], experimental_use_pfor=False)
                     
-                # If parameter is output from the network, get the batch_jacobian instead
-                elif( parameter in self.nn_pars ):
+                    # Use AutoGraph compatible tf.shape() instead of .shape to prevent NoneType crashes on dynamic batches
+                    if parameter_jacobian is not None and x is not None and self.neural_network_use:
+                        if tf.shape(parameter_jacobian)[0] != batch_size:
+                            parameter_jacobian = tf.broadcast_to(parameter_jacobian, (batch_size, tf.shape(parameter_jacobian)[1], tf.shape(parameter_jacobian)[2]))
+                            
+                elif parameter in self.nn_pars:
                     try:
-                        parameter_jacobian = self._delta_tape.batch_jacobian(f_theta, ordered_theta_tensors[ used_counter ], experimental_use_pfor = False)
+                        parameter_jacobian = self._delta_tape.batch_jacobian(f_theta, ordered_theta_tensors[used_counter], experimental_use_pfor=False)
                     except ValueError:
                         parameter_jacobian = None
-                # Increase the counter for the next used parameter in ordered_theta_tensors
+                        
                 used_counter += 1
-                # If get_variable was called, but parameter was not used, the jacobian still returns None
-                if(parameter_jacobian is None):
-                    if(x is not None):
-                        jacobian_zeros = tf.zeros((x.shape[0], f_theta.shape[1], self.parameters[parameter]["shape"]))
-                    else:
-                        jacobian_zeros = tf.zeros((1, f_theta.shape[1], self.parameters[parameter]["shape"]))
+                
+                if parameter_jacobian is None:
+                    jacobian_zeros = tf.zeros((batch_size, tf.shape(f_theta)[1], self.parameters[parameter]["shape"]))
                     parameter_jacobian = jacobian_zeros
                     
-                J_list.append( parameter_jacobian )
-            # If parameter was not used, we must impute its shape of zeros in the Jacobian matrix
+                J_list.append(parameter_jacobian)
             else:
-                if(x is not None):
-                    jacobian_zeros = tf.zeros((x.shape[0], f_theta.shape[1], self.parameters[parameter]["shape"]))
-                else:
-                    jacobian_zeros = tf.zeros((1, f_theta.shape[1], self.parameters[parameter]["shape"]))
-                J_list.append( jacobian_zeros )
+                jacobian_zeros = tf.zeros((batch_size, tf.shape(f_theta)[1], self.parameters[parameter]["shape"]))
+                J_list.append(jacobian_zeros)
 
+        J = tf.concat(J_list, axis=-1)
         
-        # Concatenate all gradients into the jacobian matrix and virtually increase one dimension for following operation
-        J = tf.concat(J_list, axis = -1)
-        
-        # 5. Clean up the state so it doesn't interfere with standard training
         self._delta_tape = None
         self._tracked_theta_tensors = None
         
-        # Finally, with the Jacobian ordered and ready, the covariance matrix for function fun is J theta_cov J^T from the Delta method
-        # This operation is simply expressed in terms of the Einstein summation convention given below
-        fun_cov = tf.einsum("...il, ...lj, ...ju -> ...iu", J, theta_cov, tf.transpose(J, perm = [0,2,1]))
-        
+        fun_cov = tf.einsum("...il, ...lj, ...ju -> ...iu", J, theta_cov, tf.transpose(J, perm=[0,2,1]))
         return fun_cov
-        
 
+    def variable_function_covariance(self, fun, data, x = None):
+        """
+        Receives a single dimensional function of independent and nn parameters and 
+        returns its corresponding variance for all observations queried.
+        Supports raw tensors, numpy arrays, or tf.data.Dataset.
+        """
+        # Handle tf.data.Dataset (The Massive C++ Batch Route)
+        if(isinstance(x, tf.data.Dataset)):
+            # Passes `data` as extra auxiliary data to be appended to each batch
+            return self._compiled_variable_function_covariance_dataset(fun, dataset = x, extra_data = data)
+            
+        # Handle missing x (Independent parameters only)
+        if(x is None):
+            return self._compute_variable_function_covariance_math(fun, data, x = None)
+            
+        # Handle Raw Numpy Arrays / Tensors (Your Original Route)
+        x_input = tf.cast(x, dtype = tf.float32)
+        if(len(x_input.shape) == 1):
+            x_input = tf.reshape(x_input, shape=(tf.shape(x_input)[0], 1))
+            
+        return self._compute_variable_function_covariance_math(fun, data, x=x_input)
     
             
+
