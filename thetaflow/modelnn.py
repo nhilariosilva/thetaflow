@@ -2319,16 +2319,17 @@ class ModelNN(keras.models.Model):
             if(self.neural_network_use):
                 batch_full_data_check = (x_batch,) + batch_data_tuple
             else:
-                batch_full_data_check = batch_data_tuple
+                # If no neural network is used, it still must pass the x predictor as None
+                batch_full_data_check = (None,) + batch_data_tuple
 
-            with tf.GradientTape(watch_accessed_variables=False) as tape1_check:
+            with tf.GradientTape(watch_accessed_variables = False) as tape1_check:
                 tape1_check.watch(native_vars)
                 
                 if(self.neural_network_use):
                     nn_output_check = self(x_batch, training = False)
                 else:
                     nn_output_check = None
-                    
+
                 loss_value_check = self.loglikelihood_loss(self, nn_output = nn_output_check, data = batch_full_data_check)
                 
             return tape1_check.gradient(loss_value_check, native_vars)
@@ -2409,7 +2410,7 @@ class ModelNN(keras.models.Model):
             if(self.neural_network_use):
                 batch_full_data_reconstructed = (x_batch,) + batch_data_tuple
             else:
-                batch_full_data_reconstructed = batch_data_tuple
+                batch_full_data_reconstructed = (None,) + batch_data_tuple
                 
             # Set watch_accessed_variables = False to stop TF from tracking the CNN convolutions and only track final layer
             with tf.GradientTape(persistent = True, watch_accessed_variables = False) as tape2:
@@ -2647,9 +2648,9 @@ class ModelNN(keras.models.Model):
 
         # 2. Handle missing x (Independent parameters only)
         if(x is None):
-            if not self.independent_pars_use:
+            if(not self.independent_pars_use):
                 raise TypeError("Please, provide a list of input values, x.")
-            else:
+            elif(self.neural_network_use):
                 warnings.simplefilter("always", UserWarning)
                 warnings.warn(
                     "Model supports both neural network modeled parameters and independent parameters.\n" + \
@@ -2895,7 +2896,7 @@ class ModelNN(keras.models.Model):
                 x_input = tf.reshape(x_input, shape=(len(x_input), 1))
                 
             if self.neural_network_use:
-                nn_output = self(x_input, training=False)
+                nn_output = self(x_input, training = False)
                 
             raw_cov, theta_cov = self.covariance_output(x_input)
             n_samples = x_input.shape[0]
@@ -2907,7 +2908,7 @@ class ModelNN(keras.models.Model):
         # 4. Vectorized parameter extraction and Delta method boundaries
         for i in range(theta_cov.shape[1]):
             # Identify the parameter name and its vector index
-            if i < self.independent_output_size:
+            if(i < self.independent_output_size):
                 par_index_var = self.independent_index_to_vars[i][4:] # Remove raw_ prefix
             else:
                 j = i - self.independent_output_size
@@ -2916,18 +2917,18 @@ class ModelNN(keras.models.Model):
             par_index_var_split = par_index_var.split("[")
             par_name = par_index_var_split[0]
             
-            if par_name == par_index_var:
+            if(par_name == par_index_var):
                 par_index = 0
             else:
                 par_index = int(par_index_var_split[-1].split("]")[0])
 
             # Extract the raw parameter (Before the link function)
-            if i < self.independent_output_size:
+            if(i < self.independent_output_size):
                 # Independent parameters are constant, so we repeat them for the sample size
-                raw_scalar = self.get_variable(par_name, nn_output, get_raw_value=True, force_true=True)[par_index]
+                raw_scalar = self.get_variable(par_name, nn_output = None, get_raw_value = True, force_true = True)[par_index]
                 raw_par_value = tf.repeat(raw_scalar, n_samples)
             else:
-                raw_par_value = self.get_variable(par_name, nn_output, get_raw_value=True, force_true=True)[:, par_index]
+                raw_par_value = self.get_variable(par_name, nn_output, get_raw_value = True, force_true = True)[:, par_index]
             
             # 1. Transform raw parameter to natural scale
             par_value = self.parameters[par_name]["link"](raw_par_value)

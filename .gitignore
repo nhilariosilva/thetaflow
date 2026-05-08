@@ -15,3 +15,7 @@ LICENSE
 
 **/venv/
 **/env/
+
+*.png
+*.jpg
+*.pdf

@@ -1,6 +1,6 @@
 from .modelnn import ModelNN
 
-__version__ = "0.0.20" # Manually update this when you bump versions
+__version__ = "0.0.22" # Manually update this when you bump versions
 
 # This allows users to do:
 # import thetaflow as tf

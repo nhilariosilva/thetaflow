@@ -49,3 +49,9 @@ Dev Log: April 29, 2026
 
 - Added the tf.Dataset memory friendly processing approach for functions variable_function_covariance, summary, predict, covariance_output, evaluate_loss. Now, these functions support both raw data structures and tf.Datasets, handling memory accordingly
 - Fixed bug where finetune training hyperparameters were not being considered for the _compiled_training_loop_rawdata call in train_model
+
+Dev Log: May 8, 2026
+
+- Inside the get_covariances function, fixed a bug that led to an error when using a model with independent parameters only (no neural network components)
+- In the same case, Warning about neural network being used was showing up even when self.neural_network_use was False. Fixed now
+- Fixed minor bug in summary, that made so that the point prediction of independent parameters were wrong when having other, nn variables in the model
