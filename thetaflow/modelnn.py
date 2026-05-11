@@ -1330,11 +1330,11 @@ class ModelNN(keras.models.Model):
                     fine_tune = True,
                     get_covariances = True, covariance_jitter = 1.0e-6,
                     finetune_epochs = None,
-                    finetune_early_stopping = True, finetune_early_stopping_patience = 10,
-                    finetune_early_stopping_warmup = 100,
-                    finetune_reduce_lr = True, finetune_reduce_lr_warmup = 0, finetune_reduce_lr_factor = 0.5,
-                    finetune_reduce_lr_min_delta = 0.0, finetune_reduce_lr_patience = 5,
-                    finetune_reduce_lr_cooldown = 0, finetune_reduce_lr_min_lr = 1e-5,
+                    finetune_early_stopping = None, finetune_early_stopping_patience = None,
+                    finetune_early_stopping_warmup = None,
+                    finetune_reduce_lr = None, finetune_reduce_lr_warmup = None, finetune_reduce_lr_factor = None,
+                    finetune_reduce_lr_min_delta = None, finetune_reduce_lr_patience = None,
+                    finetune_reduce_lr_cooldown = None, finetune_reduce_lr_min_lr = None,
                     deterministic = True,
                     verbose = True, print_freq = 25, track_time = True):
         
@@ -1525,8 +1525,29 @@ class ModelNN(keras.models.Model):
             # Therefore, we necessarily fix the training data loss to be the observed metric for early stopping and learning rate reduction
             # We also remove the possibility of reducing the learning rate and to 
 
+            # If hyperparameters for fine tuning were not provided, consider the training parameters instead
             if(finetune_epochs is None):
                 finetune_epochs = epochs
+            if(finetune_early_stopping is None):
+                finetune_early_stopping = early_stopping
+            if(finetune_early_stopping_patience is None):
+                finetune_early_stopping_patience = early_stopping_patience
+            if(finetune_early_stopping_warmup is None):
+                finetune_early_stopping_warmup = early_stopping_warmup
+            if(finetune_reduce_lr is None):
+                finetune_reduce_lr = reduce_lr
+            if(finetune_reduce_lr_warmup is None):
+                finetune_reduce_lr_warmup = reduce_lr_warmup
+            if(finetune_reduce_lr_factor is None):
+                finetune_reduce_lr_factor = reduce_lr_factor
+            if(finetune_reduce_lr_min_delta is None):
+                finetune_reduce_lr_min_delta = reduce_lr_min_delta
+            if(finetune_reduce_lr_patience is None):
+                finetune_reduce_lr_patience = reduce_lr_patience
+            if(finetune_reduce_lr_cooldown is None):
+                finetune_reduce_lr_cooldown = reduce_lr_cooldown
+            if(finetune_reduce_lr_min_lr is None):
+                finetune_reduce_lr_min_lr = reduce_lr_min_lr
                 
             finetune_epochs = tf.constant(finetune_epochs, dtype = tf.int32)
             

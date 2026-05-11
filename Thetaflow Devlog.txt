@@ -55,3 +55,7 @@ Dev Log: May 8, 2026
 - Inside the get_covariances function, fixed a bug that led to an error when using a model with independent parameters only (no neural network components)
 - In the same case, Warning about neural network being used was showing up even when self.neural_network_use was False. Fixed now
 - Fixed minor bug in summary, that made so that the point prediction of independent parameters were wrong when having other, nn variables in the model
+
+Dev Log: May 11, 2026
+
+- Changed training function so that fine tuning hyperparameters are the same from the training step, if not provided
