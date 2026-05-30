@@ -59,3 +59,15 @@ Dev Log: May 8, 2026
 Dev Log: May 11, 2026
 
 - Changed training function so that fine tuning hyperparameters are the same from the training step, if not provided
+
+Dev Log: May 28, 2026
+
+- Added reshuffle_each_iteration = True and seed = self.seed in all calls to tf.data.Dataset shuffle to ensure reproducibility
+
+Dev Log May 30, 2026
+
+- Updated verification for batches in config_training. Now it is more robust to detecting whether tf.data.Dataset was indeed previously batched or not
+- Now the package verifies whether a given batched tf.data.Dataset trully corresponds to the original input_dim. If now, it raises an error that the user possibly batched twice, or is considering a Dataset completely different from what the input dimension specifies
+- Following the change above, we also set the input_dim argument as mandatory from now
+
+MUST STILL CHECK THE AUTOMATIC TRAIN-VAL SPLIT IF USER DOES NOT PROVIDE IT FOR DATASETS. CURRENTLY IT SEEMS TO BE SUBOPTIMAL. FOR OPTIMALITY, USER MUST SPECIFY IT MANUALLY
