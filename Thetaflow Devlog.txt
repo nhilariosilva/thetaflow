@@ -70,4 +70,15 @@ Dev Log May 30, 2026
 - Now the package verifies whether a given batched tf.data.Dataset trully corresponds to the original input_dim. If now, it raises an error that the user possibly batched twice, or is considering a Dataset completely different from what the input dimension specifies
 - Following the change above, we also set the input_dim argument as mandatory from now
 
-MUST STILL CHECK THE AUTOMATIC TRAIN-VAL SPLIT IF USER DOES NOT PROVIDE IT FOR DATASETS. CURRENTLY IT SEEMS TO BE SUBOPTIMAL. FOR OPTIMALITY, USER MUST SPECIFY IT MANUALLY
+Dev Log June 2, 2026
+
+- Fixed buffer_size double verification in config_training. If user passes value lesser than training size, explicitly set the buffer to 3 times the training size, to avoid OOM problems
+
+Future fixes:
+- Fix model structure so that it natively supports likelihood loss functions based on tf.reduce_mean instead of tf.reduce_sum. That makes training much more stable and easy to interpret (Not difficult to implement). Require testing how Regularization is working now and how it will relate to this. Apparently, the current implementation with regularizers is broken, given the huge dimension of the loss
+- Implement routine that detects if a model has no neural network components and optimize its parameters according to a standard double order optimizer (such has BFGS) as a standard procedure. The user may still deliberatly configure it to use gradient descent if they want to though, as some more complex models may present optimization problems even without neural networks.
+- 
+
+
+
+

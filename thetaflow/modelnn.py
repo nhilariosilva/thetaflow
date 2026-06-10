@@ -2280,8 +2280,10 @@ class ModelNN(keras.models.Model):
 
         self.compile_model(optimizer_independent = optimizer_independent, optimizer_nn = optimizer_nn)
 
-        # Create the training dataset
+        # If the provided buffer size is lesser than the training data, explicitly set it to be 3 times the training set size
         self.buffer_size = buffer_size
+        if(buffer_size is None or buffer_size < self.n_train):
+            self.buffer_size = 3*self.n_train
 
         train_tuple = (self.x_train, *self.data_train) if self.x_train is not None else tuple(self.data_train)
         train_dataset = tf.data.Dataset.from_tensor_slices( train_tuple )
