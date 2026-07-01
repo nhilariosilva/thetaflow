@@ -74,6 +74,21 @@ Dev Log June 2, 2026
 
 - Fixed buffer_size double verification in config_training. If user passes value lesser than training size, explicitly set the buffer to 3 times the training size, to avoid OOM problems
 
+Dev Log June 11, 2026
+
+- Improved the progress bar to point both training and validation average losses (improve interpretability of convergence, instead of total loss), as well as what is the metric of interest for reduce_learning_rate and early_stopping (the one indicated in the best metric is the one chosen for model evaluation).
+- Fixed a bug in the training routine for tf.data.Dataset data inputs where the evaluation metrics took into account the regularization values. Ideally, the regularization should be applied just during the gradient calculations during training. We should not early stop based on a regularized metric (Note that in order for a model to improve, it may be naturally necessary to increase its weights to fit the data. If we keep the regularization loss for early stopping, the model will likely stop training too early)
+- Fixed a source of confusion for early stopping. If contribution to the loss is less than delta value, it gets completely ignored by the model, leading the best reported loss to be greater than the model final loss. The delta parameter should regulate only whether that loss improvement is relevant to completely reset the patience counter. Now, if model keeps improving less than delta for the next iterations, we will early stop at the same epoch as before (i.e. that improvement will not be enough to reset the patience), however, the best metric and weights associated to that best metric will still be saved at the actual point where they were observed
+
+Dev Log June 13, 2026
+
+- Fixed a bug where the corrections in early stopping in the previous Dev Log were not applying for dataset training
+- Created a new input variable early_stopping_min_delta that separates loss improvement evaluation for early stopping and for reduce learning rate
+
+Dev Log June 30, 2026
+
+- Fixed a bug when applying gradients that led it to work only when clipnorm was added to optimizer (Very specific bug)
+
 Future fixes:
 - Fix model structure so that it natively supports likelihood loss functions based on tf.reduce_mean instead of tf.reduce_sum. That makes training much more stable and easy to interpret (Not difficult to implement). Require testing how Regularization is working now and how it will relate to this. Apparently, the current implementation with regularizers is broken, given the huge dimension of the loss
 - Implement routine that detects if a model has no neural network components and optimize its parameters according to a standard double order optimizer (such has BFGS) as a standard procedure. The user may still deliberatly configure it to use gradient descent if they want to though, as some more complex models may present optimization problems even without neural networks.

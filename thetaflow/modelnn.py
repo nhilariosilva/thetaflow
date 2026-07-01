@@ -589,7 +589,7 @@ class ModelNN(keras.models.Model):
         # Loop through the dataset natively in the C++ graph
         for batch_full_data in dataset:
             
-            # 1. Unpack the batch
+            # Unpack the batch
             if self.neural_network_use:
                 x_batch = batch_full_data[0]
                 batch_data_tuple = batch_full_data[1:]
@@ -597,30 +597,24 @@ class ModelNN(keras.models.Model):
                 x_batch = None
                 batch_data_tuple = batch_full_data
 
-            # 2. Dimension guard to prevent broadcasting errors
+            # Dimension guard to prevent broadcasting errors
             batch_data_tuple = tuple(
                 [tf.expand_dims(d, axis=-1) if len(d.shape) == 1 else d for d in batch_data_tuple]
             )
             batch_full_data_reconstructed = (x_batch,) + batch_data_tuple
             
-            # 3. Forward pass strictly in inference mode (training=False)
+            # Forward pass strictly in inference mode (training=False)
             if self.neural_network_use:
                 nn_output_batch = self(x_batch, training=False)
             else:
                 nn_output_batch = None
 
-            # 4. Calculate loss for the current batch
+            # Calculate loss for the current batch
             batch_loss = self.loglikelihood_loss(self, nn_output=nn_output_batch, data=batch_full_data_reconstructed)
-            
-            # 5. Add regularization penalties if any exist
-            if self.losses:
-                regularization_penalty = tf.math.add_n(self.losses)
-                # Scale the penalty down by the dataset cardinality so it doesn't artificially inflate
-                # Note: We divide by dataset cardinality here if penalty is per-sample, 
-                # but standard Keras adds it directly. Adjust scaling if necessary for your formulation.
-                batch_loss += regularization_penalty 
 
-            # 6. Accumulate the loss
+            # Reminder that we actively avoid computing the regularization loss inside the evaluation steps
+            
+            # Accumulate the loss
             total_loss += batch_loss
 
         return total_loss
@@ -632,6 +626,7 @@ class ModelNN(keras.models.Model):
                                         early_stopping = True,
                                         early_stopping_patience = tf.constant(10, dtype = tf.int32),
                                         early_stopping_warmup = tf.constant(0, dtype = tf.int32),
+                                        early_stopping_min_delta = tf.constant(0.0, dtype = tf.float32),
                                         reduce_lr = True,
                                         reduce_lr_warmup = tf.constant(0, dtype = tf.int32),
                                         reduce_lr_factor = tf.constant(0.5, dtype = tf.float32),
@@ -721,6 +716,12 @@ class ModelNN(keras.models.Model):
                     # Automatic regularization from layer definitions. Check if any layer in the model generated a regularization loss
                     if(self.losses):
                         # sums all tensors in the self.losses list
+                        # regularization_penalty = tf.math.add_n( self.losses )
+                        # Add it to the base log-likelihood rescaling it according to the training sample size
+                        # Note that we assume the user provide the mean log-likelihood, not the sum log-likelihood
+                        # loss_value = loss_value + regularization_penalty / tf.cast(self.n_train, tf.float32)
+
+                        # sums all tensors in the self.losses list
                         regularization_penalty = tf.math.add_n( self.losses )
 
                         current_batch_size = tf.cast(tf.shape(batch_data_tuple[0])[0], tf.float32)
@@ -763,14 +764,16 @@ class ModelNN(keras.models.Model):
                 if( tf.equal(self.n_acum_step, self.gradient_accumulation_steps) ):
                     if(self.independent_pars_use):
                         ind_grads = gradients[:len(self.independent_pars)]
-                        self.optimizer_independent.apply_gradients( zip(ind_grads, self.trainable_variables[:len(self.independent_pars)]) )
+                        pure_ind_grads = [tf.identity(g) if g is not None else None for g in ind_grads]
+                        self.optimizer_independent.apply_gradients( zip(pure_ind_grads, self.trainable_variables[:len(self.independent_pars)]) )
                         # Resets all the cumulated gradients to zero
                         for i in range(len(self.gradient_accumulation_independent_pars)):
                             self.gradient_accumulation_independent_pars[i].assign( tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32) )
                         
                     if(self.neural_network_use):
                         nn_grads = gradients[len(self.independent_pars):]
-                        self.optimizer_nn.apply_gradients(zip(nn_grads, self.trainable_variables[len(self.independent_pars):]))
+                        pure_nn_grads = [tf.identity(g) if g is not None else None for g in nn_grads]
+                        self.optimizer_nn.apply_gradients(zip(pure_nn_grads, self.trainable_variables[len(self.independent_pars):]))
                         # Resets all the cumulated gradients to zero
                         for i in range(len(self.gradient_accumulation_nn)):
                             self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
@@ -803,13 +806,9 @@ class ModelNN(keras.models.Model):
                     train_batch_loss = self.loglikelihood_loss_pretrain(nn_output = nn_train_batch, data = batch_full_data_reconstructed_train)
                 else:
                     train_batch_loss = self.loglikelihood_loss(self, nn_output = nn_train_batch, data = batch_full_data_reconstructed_train)
+
+                # Reminder that we actively avoid computing the regularization loss inside the evaluation steps
                 
-                if(self.losses):
-                    regularization_penalty_train = tf.math.add_n(self.losses)
-                    current_batch_size_train = tf.cast(tf.shape(batch_data_tuple_train[0])[0], tf.float32)
-                    batch_fraction_train = current_batch_size_train / tf.cast(self.n_train, tf.float32)
-                    train_batch_loss = train_batch_loss + regularization_penalty_train * batch_fraction_train
-                    
                 current_loss_train += train_batch_loss
 
             loss_history = loss_history.write(epoch, current_loss_train)
@@ -836,16 +835,9 @@ class ModelNN(keras.models.Model):
                         val_batch_loss = self.loglikelihood_loss_pretrain(nn_output = nn_val_batch, data = batch_full_data_reconstructed_val)
                     else:
                         val_batch_loss = self.loglikelihood_loss(self, nn_output = nn_val_batch, data = batch_full_data_reconstructed_val)
+
+                    # Reminder that we actively avoid computing the regularization loss inside the evaluation steps
                     
-                    if(self.losses):
-                        regularization_penalty_val = tf.math.add_n(self.losses)
-                        
-                        current_batch_size_val = tf.cast(tf.shape(batch_data_tuple_val[0])[0], tf.float32)
-                        # Use n_val so the penalty scales perfectly for the validation set sum
-                        batch_fraction_val = current_batch_size_val / tf.cast(self.n_val, tf.float32)
-                        
-                        val_batch_loss = val_batch_loss + regularization_penalty_val * batch_fraction_val
-                        
                     current_loss_val += val_batch_loss
                 
                 # Write to validation history
@@ -864,24 +856,41 @@ class ModelNN(keras.models.Model):
             # Only start tracking the best metric after the warmup period
             # that avoids the model from getting low loss values from an initial stage of training
             # where the model may had been in a degenerate, unstable state, yet with a pathological low loss value (burnin phase)
-            if( epoch >= tf.math.minimum(early_stopping_warmup, reduce_lr_warmup) ):
-                # Check if the loss improved by at least the min_delta
-                if(current_loss < (best_metric - reduce_lr_min_delta)):
+            if(epoch >= early_stopping_warmup or epoch >= reduce_lr_warmup):
+                # Check if the loss improved by any means. If so, track its epoch and its corresponding weights
+                if(current_loss < best_metric):
+                    # Obtains how much better the current loss is
+                    improvement_size = best_metric - current_loss
+
+                    # Independent on the improvement size, saves the current epoch as the best model anyway
                     best_metric_epoch = epoch
                     best_metric = current_loss
-                    
-                    # Update the existing variables inside the self.best_weights object.
+
+                    # Do not create a new list. Update the existing variables in-place.
                     for i, w in enumerate(self.weights):
                         self.best_weights[i].assign(w)
 
-                    lr_wait = tf.constant(0, dtype = tf.int32)
-                    es_wait = tf.constant(0, dtype = tf.int32)
-                else:
+                    # Even if the loss improved, if it did not decrease by a considerable amount (more that the prespecified delta)
+                    # it does not reset the patience counters, meaning it counts as if the model did not improve at all
+                    if(epoch >= early_stopping_warmup):
+                        if( improvement_size > early_stopping_min_delta ):
+                            es_wait = tf.constant(0, dtype = tf.int32)
+                        # If loss did not improve the amout needed, we count it as a fail whatsoever (but still save its weights!)
+                        else:
+                            es_wait = es_wait + 1
+
                     if(epoch >= reduce_lr_warmup):
-                        lr_wait = lr_wait + 1
+                        if(improvement_size > reduce_lr_min_delta ):
+                            lr_wait = tf.constant(0, dtype = tf.int32)
+                        # If loss did not improve the amout needed, we count it as a fail whatsoever (but still save its weights!)
+                        else:
+                            lr_wait = lr_wait + 1
+                else:
                     if(epoch >= early_stopping_warmup):
                         es_wait = es_wait + 1
-
+                    if(epoch >= reduce_lr_warmup):
+                        lr_wait = lr_wait + 1
+                    
                 # If it has passed early_stopping_patience epochs with no improvement in the loss function, halts training
                 if(early_stopping and (es_wait >= early_stopping_patience) and (epoch > early_stopping_warmup)):
                     if(verbose):
@@ -939,23 +948,73 @@ class ModelNN(keras.models.Model):
                     
                     # If epochs_per_sec < 1, that means eack epoch takes longer than a second. We take its reciprocal to obtain sec_per_epoch
                     if(epochs_per_sec < 1):
-                        tf.print(
-                            "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
-                            "| Loss: ", current_loss, 
-                            "| Best Loss: ", best_metric,
-                            "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
-                            "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
-                            end = ""
-                        )
+                        # If validation not considered, print only the training loss and its corresponding best value
+                        if(not validation):
+                            tf.print(
+                                "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32),
+                                "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                                "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                end = ""
+                            )
+                        # If validation is considered, evaluate whether it should plot the best training or best validation value
+                        # according to the user metric of interest for early stopping
+                        else:
+                            # In this case, we still obtain the validation metric, but ignore it during model evaluation.
+                            # Since we consider the training set for early stopping here (conscious overfitting) we show the best training loss
+                            if(force_training_validation):
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32),
+                                    "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss_val / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
+                            # In this case, we are using the validation data for evaluation, so we print the best validation loss so far
+                            else:
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss_train / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss / tf.cast(self.n_val, tf.float32),
+                                    "| Best Avg. Validation NLL: ", best_metric / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
                     else:
-                        tf.print(
-                            "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
-                            "| Loss: ", current_loss, 
-                            "| Best Loss: ", best_metric,
-                            "| Speed: ", tf.cast(epochs_per_sec, tf.int32), " epoch/s   ",
-                            "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
-                            end = ""
-                        )
+                        if(not validation):
+                            tf.print(
+                                "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32), 
+                                "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                "| Speed: ", tf.cast(epochs_per_sec, tf.int32), " epoch/s   ",
+                                "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                end = ""
+                            )
+                        else:
+                            if(force_training_validation):
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32),
+                                    "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss_val / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " epoch/s   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
+                            else:
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss_train / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss / tf.cast(self.n_val, tf.float32),
+                                    "| Best Avg. Validation NLL: ", best_metric / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " epoch/s   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
             # --------------------------------------------------------------------------------------------------------------------------------------------------
                 
             # Stop if converged or an error occurred
@@ -988,6 +1047,7 @@ class ModelNN(keras.models.Model):
                                         early_stopping = True,
                                         early_stopping_patience = tf.constant(10, dtype = tf.int32),
                                         early_stopping_warmup = tf.constant(0, dtype = tf.int32),
+                                        early_stopping_min_delta = tf.constant(0.0, dtype = tf.float32),
                                         reduce_lr = True,
                                         reduce_lr_warmup = tf.constant(0, dtype = tf.int32),
                                         reduce_lr_factor = tf.constant(0.5, dtype = tf.float32),
@@ -1094,13 +1154,21 @@ class ModelNN(keras.models.Model):
                         loss_value = self.loglikelihood_loss(self, nn_output = nn_output_batch, data = batch_full_data)
 
                     # loss_history = loss_history.write(epoch, loss_value)
-                                      
+                    
                     # Automatic regularization from layer definitions. Check if any layer in the model generated a regularization loss
                     if(self.losses):
                         # sums all tensors in the self.losses list
+                        # regularization_penalty = tf.math.add_n( self.losses )
+                        # Add it to the base log-likelihood rescaling it according to the training sample size
+                        # Note that we assume the user provide the mean log-likelihood, not the sum log-likelihood
+                        # loss_value = loss_value + regularization_penalty / tf.cast(n_samples, tf.float32)
+
+                        # sums all tensors in the self.losses list
                         regularization_penalty = tf.math.add_n( self.losses )
 
-                        batch_fraction = tf.cast(tf.shape(x_batch)[0], tf.float32) / tf.cast(n_samples, tf.float32)
+                        current_batch_size = tf.cast(tf.shape(batch_data_tuple[0])[0], tf.float32)
+                        batch_fraction = current_batch_size / tf.cast(self.n_train, tf.float32)
+                        
                         # Add it to the base log-likelihood
                         loss_value = loss_value + regularization_penalty * batch_fraction
                 
@@ -1138,14 +1206,16 @@ class ModelNN(keras.models.Model):
                 if( tf.equal(self.n_acum_step, self.gradient_accumulation_steps) ):
                     if(self.independent_pars_use):
                         ind_grads = gradients[:len(self.independent_pars)]
-                        self.optimizer_independent.apply_gradients( zip(ind_grads, self.trainable_variables[:len(self.independent_pars)]) )
+                        pure_ind_grads = [tf.identity(g) if g is not None else None for g in ind_grads]
+                        self.optimizer_independent.apply_gradients( zip(pure_ind_grads, self.trainable_variables[:len(self.independent_pars)]) )
                         # Resets all the cumulated gradients to zero
                         for i in range(len(self.gradient_accumulation_independent_pars)):
                             self.gradient_accumulation_independent_pars[i].assign( tf.zeros_like(self.trainable_variables[ :len(self.independent_pars) ][i], dtype = tf.float32) )
                         
                     if(self.neural_network_use):
                         nn_grads = gradients[len(self.independent_pars):]
-                        self.optimizer_nn.apply_gradients(zip(nn_grads, self.trainable_variables[len(self.independent_pars):]))
+                        pure_nn_grads = [tf.identity(g) if g is not None else None for g in nn_grads]
+                        self.optimizer_nn.apply_gradients(zip(pure_nn_grads, self.trainable_variables[len(self.independent_pars):]))
                         # Resets all the cumulated gradients to zero
                         for i in range(len(self.gradient_accumulation_nn)):
                             self.gradient_accumulation_nn[i].assign(tf.zeros_like(self.trainable_variables[ len(self.independent_pars): ][i], dtype = tf.float32))
@@ -1195,23 +1265,40 @@ class ModelNN(keras.models.Model):
                 # Only start tracking the best metric after the warmup period
                 # that avoids the model from getting low loss values from an initial stage of training
                 # where the model may had been in a degenerate, unstable state, yet with a pathological low loss value (burnin phase)
-                if(epoch >= early_stopping_warmup):
-                    # Check if the loss improved by at least the min_delta
-                    if(current_loss < (best_metric - reduce_lr_min_delta)):
+                if(epoch >= early_stopping_warmup or epoch >= reduce_lr_warmup):
+                    # Check if the loss improved by any means. If so, track its epoch and its corresponding weights
+                    if(current_loss < best_metric):
+                        # Obtains how much better the current loss is
+                        improvement_size = best_metric - current_loss
+
+                        # Independent on the improvement size, saves the current epoch as the best model anyway
                         best_metric_epoch = epoch
                         best_metric = current_loss
-                        # best_weights = [tf.identity(w) for w in self.trainable_variables]
-                        # self.best_weights = [tf.Variable(w, trainable = False) for w in self.weights]
     
-                        # Do NOT create a new list. Update the existing variables in-place.
+                        # Do not create a new list. Update the existing variables in-place.
                         for i, w in enumerate(self.weights):
                             self.best_weights[i].assign(w)
+
+                        # Even if the loss improved, if it did not decrease by a considerable amount (more that the prespecified delta)
+                        # it does not reset the patience counters, meaning it counts as if the model did not improve at all
+                        if(epoch >= early_stopping_warmup):
+                            if( improvement_size > early_stopping_min_delta ):
+                                es_wait = tf.constant(0, dtype = tf.int32)
+                            # If loss did not improve the amout needed, we count it as a fail whatsoever (but still save its weights!)
+                            else:
+                                es_wait = es_wait + 1
     
-                        lr_wait = tf.constant(0, dtype = tf.int32)
-                        es_wait = tf.constant(0, dtype = tf.int32)
+                        if(epoch >= reduce_lr_warmup):
+                            if(improvement_size > reduce_lr_min_delta ):
+                                lr_wait = tf.constant(0, dtype = tf.int32)
+                            # If loss did not improve the amout needed, we count it as a fail whatsoever (but still save its weights!)
+                            else:
+                                lr_wait = lr_wait + 1
                     else:
-                        lr_wait = lr_wait + 1
-                        es_wait = es_wait + 1
+                        if(epoch >= early_stopping_warmup):
+                            es_wait = es_wait + 1
+                        if(epoch >= reduce_lr_warmup):
+                            lr_wait = lr_wait + 1
                 
                 # If it has passed early_stopping_patience epochs with no improvement in the loss function, halts training
                 if(early_stopping and es_wait >= early_stopping_patience and epoch > early_stopping_warmup):
@@ -1272,23 +1359,73 @@ class ModelNN(keras.models.Model):
                     
                     # If epochs_per_sec < 1, that means eack epoch takes longer than a second. We take its reciprocal to obtain sec_per_epoch
                     if(epochs_per_sec < 1):
-                        tf.print(
-                            "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
-                            "| Loss: ", current_loss, 
-                            "| Best Loss: ", best_metric,
-                            "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
-                            "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
-                            end = ""
-                        )
+                        # If validation not considered, print only the training loss and its corresponding best value
+                        if(not validation):
+                            tf.print(
+                                "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32),
+                                "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                                "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                end = ""
+                            )
+                        # If validation is considered, evaluate whether it should plot the best training or best validation value
+                        # according to the user metric of interest for early stopping
+                        else:
+                            # In this case, we still obtain the validation metric, but ignore it during model evaluation.
+                            # Since we consider the training set for early stopping here (conscious overfitting) we show the best training loss
+                            if(force_training_validation):
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32),
+                                    "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss_val / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
+                            # In this case, we are using the validation data for evaluation, so we print the best validation loss so far
+                            else:
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss_train / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss / tf.cast(self.n_val, tf.float32),
+                                    "| Best Avg. Validation NLL: ", best_metric / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " s/epoch   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
                     else:
-                        tf.print(
-                            "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
-                            "| Loss: ", current_loss, 
-                            "| Best Loss: ", best_metric,
-                            "| Speed: ", tf.cast(epochs_per_sec, tf.int32), " epoch/s   ",
-                            "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
-                            end = ""
-                        )
+                        if(not validation):
+                            tf.print(
+                                "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32), 
+                                "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                "| Speed: ", tf.cast(epochs_per_sec, tf.int32), " epoch/s   ",
+                                "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                end = ""
+                            )
+                        else:
+                            if(force_training_validation):
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss / tf.cast(self.n_train, tf.float32),
+                                    "| Best Avg. Train NLL: ", best_metric / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss_val / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " epoch/s   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
+                            else:
+                                tf.print(
+                                    "\rOptimizing... Epoch: [", epoch, "/", epochs, "] ",
+                                    "| Avg. Train NLL: ", current_loss_train / tf.cast(self.n_train, tf.float32),
+                                    "| Avg. Validation NLL: ", current_loss / tf.cast(self.n_val, tf.float32),
+                                    "| Best Avg. Validation NLL: ", best_metric / tf.cast(self.n_val, tf.float32),
+                                    "| Speed: ", tf.cast(1 / epochs_per_sec, tf.float32), " epoch/s   ",
+                                    "| Elapsed Time: ", tf.cast(elapsed_time, tf.float32), " s   ",
+                                    end = ""
+                                )
             # --------------------------------------------------------------------------------------------------------------------------------------------------
                 
             # Stop if converged or an error occurred
@@ -1325,14 +1462,14 @@ class ModelNN(keras.models.Model):
                     fine_tune_independent_lr = None, fine_tune_nn_lr = None,
                     train_batch_size = None, val_batch_size = None,
                     buffer_size = 4096, gradient_accumulation_steps = None,
-                    early_stopping = True, early_stopping_patience = 10, early_stopping_warmup = 100,
+                    early_stopping = True, early_stopping_patience = 10, early_stopping_warmup = 100, early_stopping_min_delta = 0.0,
                     reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 5,
                     reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                     fine_tune = True,
                     get_covariances = True, covariance_jitter = 1.0e-6,
                     finetune_epochs = None,
                     finetune_early_stopping = None, finetune_early_stopping_patience = None,
-                    finetune_early_stopping_warmup = None,
+                    finetune_early_stopping_warmup = None, finetune_early_stopping_min_delta = None,
                     finetune_reduce_lr = None, finetune_reduce_lr_warmup = None, finetune_reduce_lr_factor = None,
                     finetune_reduce_lr_min_delta = None, finetune_reduce_lr_patience = None,
                     finetune_reduce_lr_cooldown = None, finetune_reduce_lr_min_lr = None,
@@ -1363,6 +1500,7 @@ class ModelNN(keras.models.Model):
 
         early_stopping_patience = tf.constant(early_stopping_patience, dtype = tf.int32)
         early_stopping_warmup = tf.constant(early_stopping_warmup, dtype = tf.int32)
+        early_stopping_min_delta = tf.constant(early_stopping_min_delta, dtype = tf.float32)
 
         reduce_lr_warmup = tf.constant(reduce_lr_warmup, dtype = tf.int32)
         reduce_lr_factor = tf.constant(reduce_lr_factor, dtype = tf.float32)
@@ -1407,6 +1545,7 @@ class ModelNN(keras.models.Model):
                 early_stopping = early_stopping,
                 early_stopping_patience = early_stopping_patience,
                 early_stopping_warmup = early_stopping_warmup,
+                early_stopping_min_delta = early_stopping_min_delta,
                 reduce_lr = reduce_lr,
                 reduce_lr_warmup = reduce_lr_warmup,
                 reduce_lr_factor = reduce_lr_factor,
@@ -1430,6 +1569,7 @@ class ModelNN(keras.models.Model):
                 early_stopping = early_stopping,
                 early_stopping_patience = early_stopping_patience,
                 early_stopping_warmup = early_stopping_warmup,
+                early_stopping_min_delta = early_stopping_min_delta,
                 reduce_lr = reduce_lr,
                 reduce_lr_warmup = reduce_lr_warmup,
                 reduce_lr_factor = reduce_lr_factor,
@@ -1535,6 +1675,8 @@ class ModelNN(keras.models.Model):
                 finetune_early_stopping_patience = early_stopping_patience
             if(finetune_early_stopping_warmup is None):
                 finetune_early_stopping_warmup = early_stopping_warmup
+            if(finetune_early_stopping_min_delta is None):
+                finetune_early_stopping_min_delta = early_stopping_min_delta
             if(finetune_reduce_lr is None):
                 finetune_reduce_lr = reduce_lr
             if(finetune_reduce_lr_warmup is None):
@@ -1554,6 +1696,7 @@ class ModelNN(keras.models.Model):
             
             finetune_early_stopping_patience = tf.constant(finetune_early_stopping_patience, dtype = tf.int32)
             finetune_early_stopping_warmup = tf.constant(finetune_early_stopping_warmup, dtype = tf.int32)
+            finetune_early_stopping_min_delta = tf.constant(finetune_early_stopping_min_delta, dtype = tf.float32)
     
             finetune_reduce_lr_warmup = tf.constant(finetune_reduce_lr_warmup, dtype = tf.int32)
             finetune_reduce_lr_factor = tf.constant(finetune_reduce_lr_factor, dtype = tf.float32)
@@ -1575,6 +1718,7 @@ class ModelNN(keras.models.Model):
                     early_stopping = finetune_early_stopping,
                     early_stopping_patience = finetune_early_stopping_patience,
                     early_stopping_warmup = finetune_early_stopping_warmup,
+                    early_stopping_min_delta = finetune_early_stopping_min_delta,
                     reduce_lr = finetune_reduce_lr,
                     reduce_lr_warmup = finetune_reduce_lr_warmup,
                     reduce_lr_factor = finetune_reduce_lr_factor,
@@ -1597,6 +1741,7 @@ class ModelNN(keras.models.Model):
                     early_stopping = finetune_early_stopping,
                     early_stopping_patience = finetune_early_stopping_patience,
                     early_stopping_warmup = finetune_early_stopping_warmup,
+                    early_stopping_min_delta = finetune_early_stopping_min_delta,
                     reduce_lr = finetune_reduce_lr,
                     reduce_lr_warmup = finetune_reduce_lr_warmup,
                     reduce_lr_factor = finetune_reduce_lr_factor,
@@ -1662,7 +1807,8 @@ class ModelNN(keras.models.Model):
                         optimizer_nn = optimizers.Adam(learning_rate = 0.001),
                         train_batch_size = None, val_batch_size = None,
                         buffer_size = 4096, gradient_accumulation_steps = None,
-                        early_stopping = True, early_stopping_patience = 10, early_stopping_warmup = 100,
+                        early_stopping = True, early_stopping_patience = 10,
+                        early_stopping_warmup = 100, early_stopping_min_delta = 0.0,
                         reduce_lr = True, reduce_lr_warmup = 0, reduce_lr_factor = 0.5, reduce_lr_min_delta = 0.0, reduce_lr_patience = 5,
                         reduce_lr_cooldown = 0, reduce_lr_min_lr = 1e-5,
                         deterministic = True,
@@ -1745,6 +1891,7 @@ class ModelNN(keras.models.Model):
 
             early_stopping_patience = tf.constant(early_stopping_patience, dtype = tf.int32)
             early_stopping_warmup = tf.constant(early_stopping_warmup, dtype = tf.int32)
+            early_stopping_min_delta = tf.constant(early_stopping_min_delta, dtype = tf.float32)
             reduce_lr_warmup = tf.constant(reduce_lr_warmup, dtype = tf.int32)
             reduce_lr_factor = tf.constant(reduce_lr_factor, dtype = tf.float32)
             reduce_lr_min_delta = tf.constant(reduce_lr_min_delta, dtype = tf.float32)
@@ -1767,6 +1914,7 @@ class ModelNN(keras.models.Model):
                     early_stopping = early_stopping,
                     early_stopping_patience = early_stopping_patience,
                     early_stopping_warmup = early_stopping_warmup,
+                    early_stopping_min_delta = early_stopping_min_delta,
                     reduce_lr = reduce_lr,
                     reduce_lr_warmup = reduce_lr_warmup,
                     reduce_lr_factor = reduce_lr_factor,
@@ -1789,6 +1937,7 @@ class ModelNN(keras.models.Model):
                     early_stopping = early_stopping,
                     early_stopping_patience = early_stopping_patience,
                     early_stopping_warmup = early_stopping_warmup,
+                    early_stopping_min_delta = early_stopping_min_delta,
                     reduce_lr = reduce_lr,
                     reduce_lr_warmup = reduce_lr_warmup,
                     reduce_lr_factor = reduce_lr_factor,
@@ -2289,7 +2438,7 @@ class ModelNN(keras.models.Model):
         train_dataset = tf.data.Dataset.from_tensor_slices( train_tuple )
         # Shuffles the dataset on every call
         if(shuffle):
-            train_dataset = train_dataset.cache().shuffle(buffer_size = self.buffer_size, reshuffle_each_iteration = True, seed = self.seed)
+            train_dataset = train_dataset.cache().shuffle(buffer_size = self.buffer_size, reshuffle_each_iteration = True)
         self.train_dataset = train_dataset.batch(self.train_batch_size).prefetch(tf.data.AUTOTUNE)
         self.train_dataset = [ tf.data.Dataset.get_single_element(self.train_dataset) ]
 
@@ -2463,8 +2612,7 @@ class ModelNN(keras.models.Model):
             return
         # ----------------------------------------------------------------------------------------------------------------------------------
         
-        # --- NEW OPTIMIZED GRAPH COMPILATION ---
-        @tf.function(reduce_retracing=True)
+        @tf.function(reduce_retracing = True)
         def _compiled_hessian_step(x_batch, batch_data_tuple):
             if(self.neural_network_use):
                 batch_full_data_reconstructed = (x_batch,) + batch_data_tuple
@@ -2485,6 +2633,12 @@ class ModelNN(keras.models.Model):
                         nn_output = None
                         
                     loss_value = self.loglikelihood_loss(self, nn_output = nn_output, data = batch_full_data_reconstructed)
+
+                    # Assume the loss function is taken using the tf.reduce_mean instead of tf.reduce_sum
+                    # From this version forward, that is the standard assumption in the package, so this rescaling is necessary
+                    # to ensure the hessian is getting calculated correctly (as a sum of all data, not an average)
+                    # batch_size = tf.cast(tf.shape(batch_data_tuple[0])[0], tf.float32)
+                    # loss_value = loss_value * batch_size
                 
                 # First Derivative
                 grads = tape1.gradient(loss_value, native_vars)
