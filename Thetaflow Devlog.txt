@@ -89,10 +89,23 @@ Dev Log June 30, 2026
 
 - Fixed a bug when applying gradients that led it to work only when clipnorm was added to optimizer (Very specific bug)
 
+
+Dev Log September 1, 2026
+
+- Added a verbose in the load_model function to avoid unnecessary printing
+- Removed a line in config_training that assumed single batches when user provided raw training data (tf.data.Dataset.get_single_element)
+
+Dev Log September 28, 2026
+
+- Added a safe check in input_dim. If user do not provide it, it natively defines it as (None, 1) assuming that, if there is a neural network, it admits a single entry variable.
+
+
+
+
+
 Future fixes:
 - Fix model structure so that it natively supports likelihood loss functions based on tf.reduce_mean instead of tf.reduce_sum. That makes training much more stable and easy to interpret (Not difficult to implement). Require testing how Regularization is working now and how it will relate to this. Apparently, the current implementation with regularizers is broken, given the huge dimension of the loss
 - Implement routine that detects if a model has no neural network components and optimize its parameters according to a standard double order optimizer (such has BFGS) as a standard procedure. The user may still deliberatly configure it to use gradient descent if they want to though, as some more complex models may present optimization problems even without neural networks.
-- 
 
 
 

@@ -61,8 +61,10 @@ class ModelNN(keras.models.Model):
         # Detects whether tf is running in a CPU or GPU device
         self.gpu_use = ( self.device.split(":")[-2].lower() == "gpu" )
 
+        # If input_dim was not given, assume there is no neural network structure to be handled
         if(input_dim is None):
-            raise ValueError("Please, provide an input dimension for the data.")
+            input_dim = (None, 1)
+            # raise ValueError("Please, provide an input dimension for the data.")
         self.input_dim = input_dim
         self.seed = seed
         # If seed was specified, fix the seed structure before initializing the model weights to ensure reproducibility
@@ -379,7 +381,7 @@ class ModelNN(keras.models.Model):
             
         print(f"Model successfully saved to {weights_path} and {meta_path}")
 
-    def load_model(self, file_prefix):
+    def load_model(self, file_prefix, verbose = True):
         """
         Loads the model weights and training metadata from disk.
         The model must be instantiated with the exact same structure before calling this.
@@ -394,14 +396,14 @@ class ModelNN(keras.models.Model):
         if not os.path.exists(weights_path) or not os.path.exists(meta_path):
             raise FileNotFoundError(f"Could not find {weights_path} or {meta_path}. Please check the file prefix.")
 
-        # 1. Load weights
+        # Load weights
         self.load_weights(weights_path)
 
-        # 2. Load metadata
+        # Load metadata
         with open(meta_path, "rb") as f:
             metadata = pickle.load(f)
 
-        # 3. Restore metadata attributes to the object
+        # Restore metadata attributes to the object
         for key, value in metadata.items():
             # Reconstruct tf.Variable tracking lists
             if key == "pre_finetuning_best_weights":
@@ -414,8 +416,9 @@ class ModelNN(keras.models.Model):
             # Restore standard metrics and configurations
             else:
                 setattr(self, key, value)
-                
-        print(f"Model successfully loaded from {file_prefix}.")
+        
+        if(verbose):
+            print(f"Model successfully loaded from {file_prefix}.")
     
     def call(self, x_input, training = True):
         if(self.neural_network_call is None):
@@ -2440,7 +2443,7 @@ class ModelNN(keras.models.Model):
         if(shuffle):
             train_dataset = train_dataset.cache().shuffle(buffer_size = self.buffer_size, reshuffle_each_iteration = True)
         self.train_dataset = train_dataset.batch(self.train_batch_size).prefetch(tf.data.AUTOTUNE)
-        self.train_dataset = [ tf.data.Dataset.get_single_element(self.train_dataset) ]
+        # self.train_dataset = [ tf.data.Dataset.get_single_element(self.train_dataset) ]
 
         val_dataset = None
         if(validation):
