@@ -16,6 +16,8 @@ LICENSE
 **/venv/
 **/env/
 
+poetry.lock
+
 *.png
 *.jpg
 *.pdf
